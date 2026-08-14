@@ -1,0 +1,171 @@
+from rest_framework import routers
+from rest_framework.routers import DefaultRouter
+from .views import (
+    DirectionViewSet, SousDirectionViewSet, ServiceViewSet, CourrierViewSet, DiligenceViewSet,
+    UserViewSet, LoginView, UserProfileView,
+    ChangePasswordView, ListUsersView, RetrieveUserView,
+    AdminRegistrationView, BureauViewSet, PresenceViewSet, RolePermissionViewSet,
+    ImputationAccessViewSet, CourrierImputationViewSet, ImputationFileViewSet,
+    UserDiligenceCommentViewSet, UserDiligenceInstructionViewSet,
+    DemandeCongeViewSet, DemandeAbsenceViewSet, UpdatePresenceStatusView, DeleteUserView,
+    CustomTokenObtainPairView, MaPresenceDuJourView, MesPresencesView, SimplePresenceView, PresenceSyncView, AgentRegistrationView,
+    DiligenceDownloadFichierView, OccurrenceSpecialeViewSet, SiteViewSet, SitePalierViewSet,
+    CourrierInstructionViewSet, CourrierAnnexeViewSet, PresenceSummaryView
+)
+from .views_courrier_access import CourrierAccessViewSet
+from .views_courrier_stats import CourrierStatsViewSet
+from .views_courrier_notifications import CourrierNotificationViewSet
+from .views_scanner import (
+    ScannerDiscoverView, ScannerScanView,
+    ScanPreClassifyView, ScanBatchImportView, ScanWatchStatusView,
+)
+from .views_ import UserManagementViewSet, NotificationViewSet, UserRegistrationView
+from .task_views import ProjetViewSet, TacheViewSet, CommentaireViewSet, FichierViewSet, ActiviteViewSet, DomaineViewSet, ScorePerformanceViewSet
+from .diligence_views import DiligenceDocumentViewSet, DiligenceNotificationViewSet, EnhancedDiligenceViewSet
+from .geofencing_views import GeofenceAlertViewSet, GeofenceSettingsViewSet, AgentLocationViewSet, PushNotificationTokenViewSet
+from .device_locking_views import CheckDeviceLockView, LockDeviceView, UnlockDeviceView, DeviceLockViewSet
+from .agenda_views import RendezVousViewSet, RendezVousDocumentViewSet, ReunionViewSet, ReunionPresenceViewSet
+from .views_rh import (
+    FicheAgentViewSet, MissionRHViewSet, EvaluationRHViewSet,
+    FormationRHViewSet, InscriptionFormationRHViewSet, DocumentRHViewSet,
+    DemandeAttestationViewSet
+)
+from .ged_views import (
+    CategorieDocumentViewSet, DocumentViewSet, DocumentLogViewSet,
+    DemandeDestructionViewSet, SharedDocumentView,
+    ged_courriers_disponibles, ged_diligences_disponibles,
+    ged_reunions_disponibles, ged_taches_disponibles,
+)
+from .views_kpi_ged import GedKPIDecisionnelView
+from .views_kpi_rh import RHKPIDecisionnelView
+from django.urls import path, include
+from core.views_stats import PresenceStatsAPIView
+from .views_executive_kpi import ExecutiveKPIView
+from rest_framework_simplejwt.views import TokenRefreshView, TokenObtainPairView
+from .serializers import MyTokenObtainPairSerializer
+
+router = DefaultRouter()
+router.register(r'users', UserViewSet)
+router.register(r'directions', DirectionViewSet)
+router.register(r'sous-directions', SousDirectionViewSet)
+router.register(r'services', ServiceViewSet)
+router.register(r'courriers', CourrierViewSet)
+router.register(r'courrier-access', CourrierAccessViewSet)
+router.register(r'courrier-imputation', CourrierImputationViewSet, basename='courrier-imputation')
+router.register(r'courrier-stats', CourrierStatsViewSet, basename='courrier-stats')
+router.register(r'courrier-notifications', CourrierNotificationViewSet, basename='courrier-notifications')
+router.register(r'courrier-instructions', CourrierInstructionViewSet, basename='courrier-instructions')
+router.register(r'courrier-annexes', CourrierAnnexeViewSet, basename='courrier-annexes')
+router.register(r'diligences', DiligenceViewSet)
+router.register(r'imputation-files', ImputationFileViewSet)
+router.register(r'imputation-access', ImputationAccessViewSet)
+router.register(r'user-diligence-comments', UserDiligenceCommentViewSet, basename='user-diligence-comments')
+router.register(r'user-diligence-instructions', UserDiligenceInstructionViewSet, basename='user-diligence-instructions')
+router.register(r'demandes-conge', DemandeCongeViewSet, basename='demandes-conge')
+router.register(r'demandes-absence', DemandeAbsenceViewSet, basename='demandes-absence')
+router.register(r'bureaux', BureauViewSet)
+
+
+router.register(r'role-permissions', RolePermissionViewSet, basename='role-permissions')
+router.register(r'presences', PresenceViewSet, basename='presences')
+router.register(r'occurrences-speciales', OccurrenceSpecialeViewSet, basename='occurrences-speciales')
+
+# --- ROUTES GESTION D'ACTIVITE ---
+router.register(r'activites', ActiviteViewSet)
+router.register(r'domaines', DomaineViewSet)
+
+# --- SCORE DE PERFORMANCE ---
+router.register(r'score-performance', ScorePerformanceViewSet, basename='score-performance')
+
+# --- ROUTES NOTIFICATIONS ---
+router.register(r'notifications', NotificationViewSet, basename='notifications')
+
+# --- ROUTES DILIGENCES AMÉLIORÉES ---
+router.register(r'diligence-documents', DiligenceDocumentViewSet)
+router.register(r'diligence-notifications', DiligenceNotificationViewSet, basename='diligence-notifications')
+router.register(r'enhanced-diligences', EnhancedDiligenceViewSet, basename='enhanced-diligences')
+
+# --- ROUTES SUIVI PROJETS & TACHES (compatibilité) ---
+router.register(r'projets', ProjetViewSet)
+router.register(r'taches', TacheViewSet)
+router.register(r'commentaires', CommentaireViewSet)
+router.register(r'fichiers', FichierViewSet)
+
+# --- ROUTES GÉOFENCING ---
+router.register(r'geofence-alerts', GeofenceAlertViewSet, basename='geofence-alerts')
+router.register(r'geofence-settings', GeofenceSettingsViewSet, basename='geofence-settings')
+router.register(r'agent-locations', AgentLocationViewSet, basename='agent-locations')
+router.register(r'push-tokens', PushNotificationTokenViewSet, basename='push-tokens')
+router.register(r'device-locks', DeviceLockViewSet, basename='device-locks')
+
+# --- ROUTES GED & ARCHIVAGE ---
+router.register(r'ged/categories', CategorieDocumentViewSet, basename='ged-categories')
+router.register(r'ged/documents', DocumentViewSet, basename='ged-documents')
+router.register(r'ged/logs', DocumentLogViewSet, basename='ged-logs')
+router.register(r'ged/demandes-destruction', DemandeDestructionViewSet, basename='ged-demandes-destruction')
+
+# --- ROUTES MODULE RH ---
+router.register(r'rh/fiches-agents', FicheAgentViewSet, basename='rh-fiches-agents')
+router.register(r'rh/missions', MissionRHViewSet, basename='rh-missions')
+router.register(r'rh/evaluations', EvaluationRHViewSet, basename='rh-evaluations')
+router.register(r'rh/formations', FormationRHViewSet, basename='rh-formations')
+router.register(r'rh/inscriptions-formations', InscriptionFormationRHViewSet, basename='rh-inscriptions-formations')
+router.register(r'rh/documents', DocumentRHViewSet, basename='rh-documents')
+router.register(r'rh/demandes-attestations', DemandeAttestationViewSet, basename='rh-demandes-attestations')
+router.register(r'sites', SiteViewSet, basename='sites')
+router.register(r'site-paliers', SitePalierViewSet, basename='site-paliers')
+
+# --- ROUTES AGENDA ---
+router.register(r'rendezvous', RendezVousViewSet, basename='rendezvous')
+router.register(r'rendezvous-documents', RendezVousDocumentViewSet, basename='rendezvous-documents')
+router.register(r'reunions', ReunionViewSet, basename='reunions')
+router.register(r'reunion-presences', ReunionPresenceViewSet, basename='reunion-presences')
+
+urlpatterns = [
+    path('token/custom/', CustomTokenObtainPairView.as_view(), name='custom_token_obtain_pair'),
+    path('token/', TokenObtainPairView.as_view(serializer_class=MyTokenObtainPairSerializer), name='token_obtain_pair'),
+    path('token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
+    path('presence/ma-presence-du-jour/', MaPresenceDuJourView.as_view(), name='ma-presence-du-jour'),
+    path('presence/mes-presences/', MesPresencesView.as_view(), name='mes-presences'),
+    # Fingerprint endpoints removed - using simple button presence now
+    path('presence/simple/', SimplePresenceView.as_view(), name='simple-presence'),
+    path('presence/sync/', PresenceSyncView.as_view(), name='presence-sync'),
+    path('presence/<int:presence_id>/update-status/', UpdatePresenceStatusView.as_view(), name='update-presence-status'),
+    path('stats/presence/', PresenceStatsAPIView.as_view(), name='presence-stats'),
+    path('presences/summary/',  PresenceSummaryView.as_view(),  name='presence-summary'),
+    path('', include(router.urls)),
+    path('ged/courriers-disponibles/', ged_courriers_disponibles, name='ged-courriers-disponibles'),
+    path('ged/diligences-disponibles/', ged_diligences_disponibles, name='ged-diligences-disponibles'),
+    path('ged/reunions-disponibles/', ged_reunions_disponibles, name='ged-reunions-disponibles'),
+    path('ged/taches-disponibles/', ged_taches_disponibles, name='ged-taches-disponibles'),
+    path('ged/kpi-decisionnel/', GedKPIDecisionnelView.as_view(), name='ged-kpi-decisionnel'),
+    path('ged/partage/<uuid:token>/', SharedDocumentView.as_view(), name='ged-partage-public'),
+    path('rh/kpi-decisionnel/', RHKPIDecisionnelView.as_view(), name='rh-kpi-decisionnel'),
+    path('auth/register/', AgentRegistrationView.as_view(), name='register'),
+    path('auth/register/admin/', AdminRegistrationView.as_view(), name='register_admin'),
+    path('auth/login/', LoginView.as_view(), name='login'),
+    path('auth/me/', UserProfileView.as_view(), name='user_profile'),
+    path('auth/change-password/', ChangePasswordView.as_view(), name='change_password'),
+    path('auth/check-device-lock/', CheckDeviceLockView.as_view(), name='check_device_lock'),
+    path('auth/lock-device/', LockDeviceView.as_view(), name='lock_device'),
+    path('auth/unlock-device/', UnlockDeviceView.as_view(), name='unlock_device'),
+    path('diligences/<int:pk>/download-fichier/', DiligenceDownloadFichierView.as_view(), name='diligence-download-fichier'),
+    path('taches/<int:pk>/commentaires/',
+         __import__('core.task_views').task_views.tache_commentaires,
+         name='tache_commentaires'),
+    path('taches/<int:pk>/commentaires/<int:comment_id>/',
+         __import__('core.task_views').task_views.tache_commentaire_detail,
+         name='tache_commentaire_detail'),
+    path('taches/<int:pk>/historique/',
+         __import__('core.task_views').task_views.tache_historique,
+         name='tache_historique'),
+    # ── Scanner ──────────────────────────────────────────────────────────────
+    path('scan/discover/',      ScannerDiscoverView.as_view(),  name='scan-discover'),
+    path('scan/scan/',          ScannerScanView.as_view(),      name='scan-scan'),
+    path('scan/pre-classify/',  ScanPreClassifyView.as_view(),  name='scan-pre-classify'),
+    path('scan/batch-import/',  ScanBatchImportView.as_view(),  name='scan-batch-import'),
+    path('scan/watch-status/',  ScanWatchStatusView.as_view(),  name='scan-watch-status'),
+    path('executive-kpi/',      ExecutiveKPIView.as_view(),      name='executive-kpi'),
+]
+
+

@@ -1,0 +1,3041 @@
+print("VIEWS.PY TOP LEVEL EXECUTED")
+import os
+print("VIEWS.PY CHARGÉ")
+import json
+import logging
+from django.conf import settings
+from django.http import HttpResponse, FileResponse
+from django.views.decorators.csrf import csrf_exempt
+from rest_framework import viewsets, permissions, status, generics
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework.decorators import api_view, permission_classes, action
+from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework_simplejwt.authentication import JWTAuthentication
+from rest_framework.authentication import TokenAuthentication
+# Nom persisté (core.Direction.nom) → code stable exploité par le frontend pour
+# donner accès aux portails de direction (DAE/DMCT/DFIR) après fusion de compte.
+# Source unique de vérité : core/direction_access.py (aussi utilisé par les
+# permissions DRF des apps DAE/DMCT pour le contrôle d'accès côté backend).
+from core.direction_access import DIRECTION_CODE_MAP, dynamic_module_permissions_for
+from django.contrib.auth.models import User
+from django.db.models import Q, Count, Prefetch
+from django.db import models
+from django.shortcuts import get_object_or_404
+from django.core.files.storage import default_storage
+from django.core.files.base import ContentFile
+from django.utils import timezone
+from datetime import datetime, timedelta, date
+import mimetypes
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+from rest_framework.authtoken.models import Token
+from django.contrib.auth import authenticate
+from rest_framework.exceptions import PermissionDenied
+from .pdf_utils import generate_conge_pdf, generate_absence_pdf, create_pdf_response
+from rest_framework.permissions import BasePermission
+from rest_framework.pagination import PageNumberPagination
+from .models import Direction, SousDirection, Service, Diligence, Courrier, UserProfile, Bureau, Presence, Agent, RolePermission, ImputationAccess, CourrierAccess, CourrierImputation, ImputationFile, UserDiligenceComment, UserDiligenceInstruction, DemandeConge, DemandeAbsence, OccurrenceSpeciale, Site, SitePalier, CourrierInstruction, CourrierAnnexe
+from .serializers import (
+    CourrierSerializer, ServiceSerializer, DirectionSerializer, SousDirectionSerializer,
+    DiligenceSerializer, UserSerializer, UserRegistrationSerializer, ImputationAccessSerializer,
+    UserDiligenceCommentSerializer, UserDiligenceInstructionSerializer, OccurrenceSpecialeSerializer,
+    ImputationFileSerializer, DemandeCongeSerializer, DemandeAbsenceSerializer,
+    BureauSerializer, CourrierImputationSerializer, PresenceSerializer, RolePermissionSerializer,
+    SiteSerializer, SitePalierSerializer, CourrierInstructionSerializer, CourrierAnnexeSerializer
+)
+from .permissions import IsProfileAdmin
+from django.contrib.auth.models import User
+from django.shortcuts import get_object_or_404
+
+logger = logging.getLogger(__name__)
+
+import logging
+logger = logging.getLogger(__name__)
+
+
+def get_site_id_for_request(request):
+    """
+    Returns the effective site_id to filter data on:
+    - Admin: reads X-Site-ID header (set by the frontend site selector)
+    - Other roles: forced to their own profile.site_id
+    Returns None if no site can be determined (no filtering applied).
+    """
+    profile = getattr(request.user, 'profile', None)
+    role = getattr(profile, 'role', None) if profile else None
+
+    if role == 'ADMIN':
+        site_id = request.headers.get('X-Site-ID') or request.query_params.get('site_id')
+        if site_id:
+            try:
+                return int(site_id)
+            except (ValueError, TypeError):
+                pass
+        return None  # Admin without a site header: sees everything
+    else:
+        # Non-admin: always forced to their own site
+        return getattr(profile, 'site_id', None)
+
+
+# SetFingerprintView removed - using simple button presence now
+
+class ImputationFileViewSet(viewsets.ModelViewSet):
+    queryset = ImputationFile.objects.all()
+    serializer_class = ImputationFileSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    def get_queryset(self):
+        queryset = ImputationFile.objects.all()
+        
+        # Filtrage par diligence (support de 'diligence' et 'diligence_id')
+        diligence_id = self.request.query_params.get('diligence') or self.request.query_params.get('diligence_id')
+        if diligence_id:
+            queryset = queryset.filter(diligence_id=diligence_id)
+            print(f"[DEBUG] ImputationFile filtered by diligence: {diligence_id}")
+        
+        # Filtrage par agent (utilisateur imputé)
+        agent_id = self.request.query_params.get('agent')
+        if agent_id:
+            queryset = queryset.filter(agent_id=agent_id)
+            print(f"[DEBUG] ImputationFile filtered by agent: {agent_id}, count: {queryset.count()}")
+        
+        return queryset
+    
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+    def create(self, request, *args, **kwargs):
+        print(f"[DEBUG] ImputationFile create - User: {request.user}, Data: {request.data}")
+        try:
+            response = super().create(request, *args, **kwargs)
+            print(f"[DEBUG] ImputationFile created successfully: {response.data}")
+            return response
+        except Exception as e:
+            print(f"[ERROR] ImputationFile creation failed: {str(e)}")
+            raise
+
+class UserViewSet(viewsets.ModelViewSet):
+    queryset = User.objects.all()
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    def get_queryset(self):
+        print('UserViewSet: requête reçue, user =', self.request.user, 'is_authenticated =', self.request.user.is_authenticated)
+        qs = User.objects.select_related(
+            'profile',
+            'profile__service',
+            'profile__service__sous_direction',
+            'profile__service__sous_direction__direction',
+            'profile__direction',
+            'profile__sous_direction',
+            'profile__site',
+        )
+        # Site isolation
+        site_id = get_site_id_for_request(self.request)
+        if site_id:
+            qs = qs.filter(profile__site_id=site_id)
+
+        roles = self.request.query_params.get('roles')
+        if roles:
+            role_list = [r.strip() for r in roles.split(',') if r.strip()]
+            qs = qs.filter(profile__role__in=role_list)
+
+        search = self.request.query_params.get('search', '').strip()
+        if search:
+            from django.db.models import Q
+            qs = qs.filter(
+                Q(first_name__icontains=search) |
+                Q(last_name__icontains=search) |
+                Q(username__icontains=search) |
+                Q(email__icontains=search)
+            )
+
+        return qs.order_by('last_name', 'first_name')
+
+    def get_serializer_class(self):
+        print(f"[DEBUG] UserViewSet using serializer: {UserSerializer}")
+        return UserSerializer
+    
+    serializer_class = UserSerializer
+    
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
+    def update(self, request, *args, **kwargs):
+        instance = self.get_object()
+        print("\nDébut de la mise à jour de l'utilisateur")
+        print("Données reçues:", request.data)
+        serializer = self.get_serializer(instance, data=request.data, partial=kwargs.get('partial', False))
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+        print("Données renvoyées:", serializer.data)
+        return Response(serializer.data)
+    
+    def get_object(self):
+        """Bypass site-filtering for direct PK lookups (update/delete/retrieve)."""
+        pk = self.kwargs.get(self.lookup_field)
+        try:
+            obj = User.objects.select_related(
+                'profile', 'profile__service',
+                'profile__service__sous_direction',
+                'profile__service__sous_direction__direction',
+                'profile__direction', 'profile__sous_direction', 'profile__site',
+            ).get(pk=pk)
+        except User.DoesNotExist:
+            from rest_framework.exceptions import NotFound
+            raise NotFound('Utilisateur non trouvé.')
+        self.check_object_permissions(self.request, obj)
+        return obj
+
+    def partial_update(self, request, *args, **kwargs):
+        kwargs['partial'] = True
+        return self.update(request, *args, **kwargs)
+
+class LoginView(APIView):
+    authentication_classes = []  # Désactive toute auth préalable
+    permission_classes = [AllowAny]
+
+    def post(self, request, *args, **kwargs):
+        print("LOGIN VIEW CALLED", request.data)
+        # Fingerprint authentication removed - using username/password only
+        username_or_email = request.data.get('username')
+        password = request.data.get('password')
+        print(f"Tentative de login pour : {username_or_email}")
+        from django.contrib.auth import get_user_model, authenticate
+        User = get_user_model()
+        user = authenticate(username=username_or_email, password=password)
+        print("AUTHENTICATE 1:", user)
+        if not user:
+            # Si username_or_email est un email, essayer de trouver le user correspondant
+            try:
+                user_obj = User.objects.get(email=username_or_email)
+                print("USER OBJ (par email):", user_obj)
+                user = authenticate(username=user_obj.username, password=password)
+                print("AUTHENTICATE 2:", user)
+            except User.DoesNotExist:
+                print("NO USER OBJ pour cet email")
+                user = None
+        if not user:
+            print("ECHEC AUTH: credentials invalid")
+            return Response({'error': 'Invalid credentials'}, status=status.HTTP_401_UNAUTHORIZED)
+        token, _ = Token.objects.get_or_create(user=user)
+        try:
+            profile = user.profile
+        except Exception:
+            return Response({'error': 'Profil utilisateur manquant'}, status=500)
+        return Response({
+            'token': token.key,
+            'role': profile.role,
+            'user': {
+                'id': user.id,
+                'username': user.username,
+                'email': user.email,
+                'first_name': user.first_name,
+                'last_name': user.last_name,
+                'role': profile.role,
+                'role_display': self.get_role_display(profile.role),
+                'service': profile.service.id if profile.service else None,
+                'direction': profile.direction.id if profile.direction else None,
+                'direction_nom': profile.direction.nom if profile.direction else None,
+                'direction_code': DIRECTION_CODE_MAP.get(profile.direction.nom) if profile.direction else None,
+                'service_nom': profile.service.nom if profile.service else None,
+                'sous_direction_nom': profile.sous_direction.nom if profile.sous_direction else None,
+                'is_direction_generale': bool(profile.direction_generale_id),
+                'dynamic_module_permissions': dynamic_module_permissions_for(user),
+                'is_formateur_dfir': hasattr(user, 'formateur_dfir'),
+                'notifications_count': user.notifications.filter(read=False).count() if hasattr(user, 'notifications') else 0
+            }
+        })
+
+    def get_role_display(self, role):
+        """Retourne une version formatée du rôle pour l'affichage"""
+        role_mapping = {
+            'ADMIN': 'Administrateur',
+            'superadmin': 'Super Administrateur',
+            'USER': 'Utilisateur',
+            'MANAGER': 'Manager'
+        }
+        return role_mapping.get(role, role)
+
+import logging
+
+class ChangePasswordView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    def post(self, request):
+        logger = logging.getLogger(__name__)
+        logger.info("[ChangePassword] Reçu POST /auth/change-password/ pour user=%s", request.user)
+        user = request.user
+        old_password = request.data.get('old_password')
+        new_password = request.data.get('new_password')
+        logger.info("[ChangePassword] Payload: old_password=%s, new_password_length=%s", bool(old_password), len(new_password) if new_password else None)
+        if not old_password or not new_password:
+            logger.warning("[ChangePassword] Champs manquants")
+            return Response({'detail': "Champs obligatoires manquants."}, status=status.HTTP_400_BAD_REQUEST)
+        if not user.check_password(old_password):
+            logger.warning("[ChangePassword] Ancien mot de passe incorrect pour user=%s", user)
+            return Response({'detail': "Ancien mot de passe incorrect."}, status=status.HTTP_400_BAD_REQUEST)
+        from django.contrib.auth.password_validation import validate_password
+        try:
+            validate_password(new_password, user)
+        except Exception as e:
+            logger.warning("[ChangePassword] Validation password échouée: %s", str(e))
+            return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        user.set_password(new_password)
+        user.save()
+        logger.info("[ChangePassword] Mot de passe changé avec succès pour user=%s", user)
+        return Response({'detail': "Mot de passe changé avec succès."})
+
+
+class UserProfileView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    def get(self, request):
+        user = request.user
+        profile = getattr(user, 'profile', None)
+        if profile is None:
+            return self._get_client_profile_response(user)
+        try:
+            # Récupérer le bureau de l'agent
+            bureau_obj = None
+            try:
+                agent = Agent.objects.get(user=user)
+                if agent.bureau:
+                    bureau_obj = {
+                        'id': agent.bureau.id,
+                        'nom': agent.bureau.nom,
+                        'latitude_centre': str(agent.bureau.latitude_centre),
+                        'longitude_centre': str(agent.bureau.longitude_centre),
+                        'rayon_metres': agent.bureau.rayon_metres
+                    }
+            except Agent.DoesNotExist:
+                pass
+            
+            # Récupérer le site du profil utilisateur
+            site_obj = None
+            try:
+                if profile.site:
+                    s = profile.site
+                    # Paliers actifs avec coordonnées GPS
+                    paliers = []
+                    for p in s.paliers.filter(est_actif=True).order_by('ordre'):
+                        paliers.append({
+                            'id': p.id,
+                            'nom': p.nom,
+                            'latitude': str(p.latitude) if p.latitude else None,
+                            'longitude': str(p.longitude) if p.longitude else None,
+                            'rayon_pointage': p.rayon_pointage,
+                        })
+                    site_obj = {
+                        'id': s.id,
+                        'nom': s.nom,
+                        'code': s.code,
+                        'latitude': str(s.latitude) if s.latitude else None,
+                        'longitude': str(s.longitude) if s.longitude else None,
+                        'rayon_pointage': s.rayon_pointage,
+                        'paliers': paliers,
+                    }
+            except Exception:
+                pass
+
+            # Un même compte Django (User) peut porter à la fois un profil e-diligence
+            # (core.Profile, prioritaire ci-dessus) et un profil labo (clients.ClientProfile).
+            # On signale ce second accès pour permettre au frontend de proposer une
+            # bascule entre les deux portails sans reconnexion.
+            other_access = None
+            client_profile = getattr(user, 'client_profile', None)
+            if client_profile is not None:
+                other_access = {
+                    'account_type': 'labo',
+                    'role': client_profile.role,
+                    'role_display': self.get_role_display(client_profile.role),
+                }
+
+            data = {
+                'id': user.id,
+                'username': user.username,
+                'email': user.email,
+                'first_name': user.first_name,
+                'last_name': user.last_name,
+                'role': profile.role,
+                'role_display': self.get_role_display(profile.role),
+                'account_type': 'ediligence',
+                'other_access': other_access,
+                'service': profile.service.id if profile.service else None,
+                'direction': profile.direction.id if profile.direction else None,
+                'direction_nom': profile.direction.nom if profile.direction else None,
+                'direction_code': DIRECTION_CODE_MAP.get(profile.direction.nom) if profile.direction else None,
+                'service_nom': profile.service.nom if profile.service else None,
+                'sous_direction_nom': profile.sous_direction.nom if profile.sous_direction else None,
+                'is_direction_generale': bool(profile.direction_generale_id),
+                'dynamic_module_permissions': dynamic_module_permissions_for(user),
+                'is_formateur_dfir': hasattr(user, 'formateur_dfir'),
+                'bureau_obj': bureau_obj,
+                'site_obj': site_obj,
+                'notifications_count': 0  # Par défaut 0 notifications
+            }
+            # Vérifier si les notifications sont configurées
+            if hasattr(user, 'notifications'):
+                data['notifications_count'] = user.notifications.filter(read=False).count()
+            return Response(data)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    def patch(self, request):
+        from .serializers import UserSerializer
+        user = request.user
+        print("PATCH DEBUG: request.data =", request.data)
+        serializer = UserSerializer(user, data=request.data, partial=True, context={'request': request})
+        print("PATCH DEBUG: serializer initial_data =", serializer.initial_data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data)
+        print("PATCH DEBUG: serializer.errors =", serializer.errors)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def get_role_display(self, role):
+        """Retourne une version formatée du rôle pour l'affichage"""
+        role_mapping = {
+            'ADMIN': 'Administrateur',
+            'superadmin': 'Super Administrateur',
+            'USER': 'Utilisateur',
+            'MANAGER': 'Manager',
+            'GESTIONNAIRE': 'Gestionnaire',
+            'TECHNICIEN': 'Technicien',
+            'CLIENT': 'Client',
+            'FOURNISSEUR': 'Fournisseur',
+            'COMPTABLE': 'Comptable',
+        }
+        return role_mapping.get(role, role)
+
+    def _get_client_profile_response(self, user):
+        """Repli pour les comptes du module labo (clients.ClientProfile) qui n'ont
+        pas de core.Profile : renvoie un payload compatible avec celui des agents
+        e-diligence pour que le frontend puisse router par role de facon unifiee."""
+        client_profile = getattr(user, 'client_profile', None)
+        if client_profile is None:
+            return Response(
+                {'error': "Aucun profil (e-diligence ou labo) associe a cet utilisateur"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        notifications_count = 0
+        if hasattr(user, 'notifications'):
+            notifications_count = user.notifications.filter(read=False).count()
+
+        data = {
+            'id': user.id,
+            'username': user.username,
+            'email': user.email,
+            'first_name': user.first_name,
+            'last_name': user.last_name,
+            'role': client_profile.role,
+            'role_display': self.get_role_display(client_profile.role),
+            'account_type': 'labo',
+            # Ce repli n'est atteint que lorsque l'utilisateur n'a pas de core.Profile
+            # (cf. get()) : il ne peut donc pas y avoir de second accès e-diligence ici.
+            'other_access': None,
+            'service': None,
+            'direction': None,
+            'bureau_obj': None,
+            'site_obj': None,
+            'organisation': client_profile.organisation,
+            'raison_sociale': client_profile.raison_sociale,
+            'notifications_count': notifications_count,
+        }
+        return Response(data)
+
+class AdminRegistrationView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []  # Désactiver l'authentification pour cette vue
+
+    def post(self, request, *args, **kwargs):
+        try:
+            logger.info("Début de la création d'un admin")
+            
+            # Vérifier s'il existe déjà un administrateur
+            admin_exists = User.objects.filter(profile__role__in=['ADMIN', 'superadmin']).exists()
+            logger.info(f"Admin existe déjà ? {admin_exists}")
+
+            # Si un admin existe déjà
+            if admin_exists:
+                logger.info("Vérification des permissions pour la création d'un nouvel admin")
+                if not request.user.is_authenticated:
+                    logger.warning("Tentative de création d'admin sans authentification")
+                    return Response(
+                        {"detail": "Vous devez être connecté pour créer un compte administrateur"},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+                if not request.user.profile.role in ['ADMIN', 'superadmin']:
+                    logger.warning(f"Tentative de création d'admin par un utilisateur non-admin: {request.user.username}")
+                    return Response(
+                        {"detail": "Seuls les administrateurs peuvent créer d'autres administrateurs"},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+
+            # Valider les données
+            data = request.data
+            logger.info(f"Données reçues: {data}")
+            
+            required_fields = ('username', 'email', 'password', 'password2', 'first_name', 'last_name')
+            missing_fields = [field for field in required_fields if field not in data]
+            
+            if missing_fields:
+                logger.warning(f"Champs manquants: {missing_fields}")
+                return Response(
+                    {"detail": f"Les champs suivants sont requis: {', '.join(missing_fields)}"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            if data['password'] != data['password2']:
+                logger.warning("Les mots de passe ne correspondent pas")
+                return Response(
+                    {"detail": "Les mots de passe ne correspondent pas"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # Log la tentative de création d'utilisateur
+            logger.info(f"[AdminRegistrationView] Tentative de création: username={data['username']}, email={data['email']}")
+            # Créer l'utilisateur
+            logger.info(f"Création de l'utilisateur {data['username']}")
+            user = User.objects.create_user(
+                username=data['username'],
+                email=data['email'],
+                password=data['password'],
+                first_name=data['first_name'],
+                last_name=data['last_name']
+            )
+
+            # Créer le profil avec le rôle admin
+            logger.info(f"Création du profil admin pour {user.username}")
+            # On force le rôle ADMIN même si le profil existe déjà
+            profile, created = UserProfile.objects.get_or_create(user=user)
+            profile.role = 'ADMIN'
+            profile.save()
+
+            logger.info(f"Admin créé avec succès: {user.username}")
+            return Response({
+                'username': user.username,
+                'email': user.email,
+                'first_name': user.first_name,
+                'last_name': user.last_name,
+                'role': 'ADMIN'
+            }, status=status.HTTP_201_CREATED)
+
+        except Exception as e:
+            logger.error(f"Erreur lors de la création de l'admin: {str(e)}")
+            return Response(
+                {"detail": str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+class AgentRegistrationView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request, *args, **kwargs):
+        import logging
+        import traceback
+        logger = logging.getLogger(__name__)
+        try:
+            serializer = UserRegistrationSerializer(data=request.data)
+            if serializer.is_valid():
+                user = serializer.save()
+                return Response({
+                    'username': user.username,
+                    'email': user.email,
+                    'first_name': user.first_name,
+                    'last_name': user.last_name,
+                    'role': user.profile.role
+                }, status=status.HTTP_201_CREATED)
+            logger.error(f'[AgentRegistrationView] Registration validation errors: {serializer.errors}')
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.error(f'[AgentRegistrationView] Unhandled exception during registration: {str(e)}')
+            logger.error(traceback.format_exc())
+            return Response({'detail': 'Internal server error. Please contact support.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class DirectionViewSet(viewsets.ModelViewSet):
+    queryset = Direction.objects.all()
+    serializer_class = DirectionSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    def get_queryset(self):
+        queryset = Direction.objects.prefetch_related('sous_directions__services').all()
+        type_direction = self.request.query_params.get('type_direction', None)
+        if type_direction:
+            queryset = queryset.filter(type_direction=type_direction)
+        return queryset.order_by('type_direction', 'nom')
+
+    def perform_create(self, serializer):
+        serializer.save()
+
+    def perform_update(self, serializer):
+        instance = serializer.save()
+        instance.updated_at = timezone.now()
+        instance.save()
+
+    def perform_destroy(self, instance):
+        # Vérifier si la direction a des sous-directions associées
+        if instance.sous_directions.exists():
+            raise serializers.ValidationError("Cette direction contient des sous-directions et ne peut pas être supprimée.")
+        instance.delete()
+
+
+class SiteViewSet(viewsets.ModelViewSet):
+    queryset = Site.objects.select_related('responsable').prefetch_related('paliers').all()
+    serializer_class = SiteSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        if self.request.query_params.get('actif'):
+            qs = qs.filter(est_actif=True)
+        return qs
+
+    def perform_destroy(self, instance):
+        # Détacher les agents du site avant suppression
+        instance.agents.all().update(site=None)
+        instance.delete()
+
+
+class SitePalierViewSet(viewsets.ModelViewSet):
+    queryset = SitePalier.objects.select_related('site').all()
+    serializer_class = SitePalierSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        site_id = self.request.query_params.get('site')
+        if site_id:
+            qs = qs.filter(site_id=site_id)
+        return qs
+
+
+class SousDirectionViewSet(viewsets.ModelViewSet):
+    queryset = SousDirection.objects.all()
+    serializer_class = SousDirectionSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    def get_queryset(self):
+        queryset = SousDirection.objects.select_related('direction').prefetch_related('services').all().order_by('-created_at')
+        direction_id = self.request.query_params.get('direction', None)
+        if direction_id:
+            queryset = queryset.filter(direction=direction_id)
+        return queryset
+
+    def perform_create(self, serializer):
+        serializer.save()
+
+    def perform_update(self, serializer):
+        instance = serializer.save()
+        instance.updated_at = timezone.now()
+        instance.save()
+
+    def perform_destroy(self, instance):
+        # Vérifier si la sous-direction a des services associés
+        if instance.services.exists():
+            raise serializers.ValidationError("Cette sous-direction contient des services et ne peut pas être supprimée.")
+        instance.delete()
+
+class ServiceViewSet(viewsets.ModelViewSet):
+    queryset = Service.objects.select_related('sous_direction__direction', 'direction').all()
+    serializer_class = ServiceSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    def get_queryset(self):
+        queryset = Service.objects.select_related('sous_direction__direction', 'direction').all().order_by('-created_at')
+        sous_direction_id = self.request.query_params.get('sous_direction', None)
+        direction_id = self.request.query_params.get('direction', None)
+        
+        if sous_direction_id:
+            queryset = queryset.filter(sous_direction=sous_direction_id)
+        elif direction_id:
+            queryset = queryset.filter(sous_direction__direction=direction_id)
+            
+        return queryset
+
+    def perform_create(self, serializer):
+        serializer.save()
+
+    def perform_update(self, serializer):
+        instance = serializer.save()
+        instance.updated_at = timezone.now()
+        instance.save()
+
+from .serializers import DirectionSerializer, ServiceSerializer, CourrierSerializer
+
+class DiligencePagination(PageNumberPagination):
+    page_size = 20
+    page_size_query_param = 'per_page'
+    max_page_size = 100
+
+class DiligenceViewSet(viewsets.ModelViewSet):
+    queryset = Diligence.objects.all()
+    serializer_class = DiligenceSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+    parser_classes = (MultiPartParser, FormParser, JSONParser)
+    pagination_class = DiligencePagination
+
+    def get_queryset(self):
+        user = self.request.user
+        profile = getattr(user, 'profile', None)
+        base_qs = Diligence.objects.select_related(
+            'courrier',
+            'courrier__service',
+            'courrier__service__direction',
+            'direction'
+        ).prefetch_related(
+            Prefetch('agents', queryset=User.objects.select_related('profile', 'profile__service')),
+            'services_concernes',
+            'services_concernes__direction'
+        ).all().order_by('-created_at')
+
+        if not profile:
+            print(f"[ERROR] No profile found for user {user.username} (ID: {user.id})")
+            return Diligence.objects.none()
+
+        role = profile.role
+
+        # Site isolation — filter base_qs to the active site
+        site_id = get_site_id_for_request(self.request)
+        if site_id:
+            base_qs = base_qs.filter(agents__profile__site_id=site_id).distinct()
+
+        # Filtrage par statut si présent dans la requête
+        statut = self.request.query_params.get('statut')
+        if statut:
+            base_qs = base_qs.filter(statut=statut)
+
+        # Build queryset for diligences accessible by ImputationAccess
+        from core.models import ImputationAccess
+        imputation_access_qs = base_qs.filter(imputation_access__user=user)
+
+        # Build queryset for diligences accessible by ImputationFile (agent imputation)
+        from core.models import ImputationFile
+        imputation_file_qs = base_qs.filter(imputation_files__agent=user)
+
+        # Filtrage par rôle
+        assigned_qs = base_qs.filter(agents=user)
+        
+        if role == 'ADMIN':
+            qs = base_qs
+            final_qs = (qs | imputation_access_qs | imputation_file_qs).distinct()
+        elif role == 'DIRECTEUR':
+            # DIRECTEUR peut voir toutes les diligences de sa direction ET des services rattachés
+            user_direction = profile.service.direction if profile.service else None
+            if user_direction:
+                # Diligences directement liées à la direction
+                direction_qs = base_qs.filter(
+                    models.Q(direction=user_direction) |
+                    models.Q(services_concernes__direction=user_direction) |
+                    models.Q(courrier__service__direction=user_direction)
+                ).distinct()
+                
+                # Diligences des agents de tous les services de cette direction
+                from core.models import Service
+                direction_services = Service.objects.filter(direction=user_direction)
+                direction_agents = User.objects.filter(profile__service__in=direction_services)
+                agents_direction_qs = base_qs.filter(agents__in=direction_agents).distinct()
+                
+                # Combiner les querysets
+                diligence_ids = set()
+                diligence_ids.update(assigned_qs.values_list('id', flat=True))
+                diligence_ids.update(direction_qs.values_list('id', flat=True))
+                diligence_ids.update(agents_direction_qs.values_list('id', flat=True))
+                diligence_ids.update(imputation_access_qs.values_list('id', flat=True))
+                diligence_ids.update(imputation_file_qs.values_list('id', flat=True))
+                
+                final_qs = base_qs.filter(id__in=diligence_ids)
+            else:
+                final_qs = (assigned_qs | imputation_access_qs | imputation_file_qs).distinct()
+        elif role == 'SUPERIEUR':
+            # SUPERIEUR peut voir ses propres diligences ET celles de ses agents
+            user_service = profile.service if profile.service else None
+            if user_service:
+                # Diligences du service du supérieur
+                service_qs = base_qs.filter(
+                    models.Q(services_concernes=user_service) |
+                    models.Q(courrier__service=user_service)
+                ).distinct()
+                
+                # Diligences des agents du même service
+                service_agents = User.objects.filter(profile__service=user_service)
+                agents_qs = base_qs.filter(agents__in=service_agents).distinct()
+                
+                # Combiner les querysets
+                diligence_ids = set()
+                diligence_ids.update(assigned_qs.values_list('id', flat=True))
+                diligence_ids.update(service_qs.values_list('id', flat=True))
+                diligence_ids.update(agents_qs.values_list('id', flat=True))
+                diligence_ids.update(imputation_access_qs.values_list('id', flat=True))
+                diligence_ids.update(imputation_file_qs.values_list('id', flat=True))
+                
+                final_qs = base_qs.filter(id__in=diligence_ids)
+            else:
+                final_qs = (assigned_qs | imputation_access_qs | imputation_file_qs).distinct()
+        else:
+            final_qs = (assigned_qs | imputation_access_qs | imputation_file_qs).distinct()
+
+        return final_qs
+
+    @action(detail=False, methods=['get'], url_path='stats',
+            permission_classes=[permissions.IsAuthenticated],
+            authentication_classes=[JWTAuthentication])
+    def stats(self, request):
+        qs = self.get_queryset()
+        from django.db.models import Count
+        counts = qs.values('statut').annotate(n=Count('id'))
+        result = {c['statut']: c['n'] for c in counts}
+        return Response({
+            'en_attente':  result.get('en_attente', 0),
+            'en_cours':    result.get('en_cours', 0),
+            'finalisee':   result.get('finalisee', 0) + result.get('termine', 0),
+            'total':       qs.count(),
+        })
+
+
+    @action(detail=True, methods=['post'], url_path='changer_statut',
+            permission_classes=[permissions.IsAuthenticated],
+            authentication_classes=[JWTAuthentication])
+    def changer_statut(self, request, pk=None):
+        """Changer le statut d'une diligence."""
+        diligence = self.get_object()
+        nouveau_statut = request.data.get('statut')
+        statuts_valides = [c[0] for c in Diligence.STATUT_CHOICES]
+        if not nouveau_statut:
+            return Response({'error': 'Le champ statut est requis.'}, status=status.HTTP_400_BAD_REQUEST)
+        if nouveau_statut not in statuts_valides:
+            return Response({'error': f'Statut invalide. Valeurs possibles : {", ".join(statuts_valides)}'}, status=status.HTTP_400_BAD_REQUEST)
+        ancien_statut = diligence.statut
+        diligence.statut = nouveau_statut
+        if nouveau_statut == 'termine':
+            from django.utils import timezone as tz
+            diligence.validated_at = tz.now()
+            diligence.validated_by = request.user
+        elif nouveau_statut == 'archivee':
+            from django.utils import timezone as tz
+            diligence.archived_at = tz.now()
+            diligence.archived_by = request.user
+        diligence.save()
+        return Response({'message': 'Statut mis à jour.', 'ancien_statut': ancien_statut, 'nouveau_statut': nouveau_statut})
+
+    @action(detail=True, methods=['post'], url_path='changer_progression',
+            permission_classes=[permissions.IsAuthenticated],
+            authentication_classes=[JWTAuthentication])
+    def changer_progression(self, request, pk=None):
+        """Mettre à jour le pourcentage d'avancement d'une diligence."""
+        diligence = self.get_object()
+        try:
+            pct = float(request.data.get('pourcentage_avancement', 0))
+        except (TypeError, ValueError):
+            return Response({'error': 'Valeur invalide pour pourcentage_avancement.'}, status=status.HTTP_400_BAD_REQUEST)
+        pct = max(0.0, min(100.0, pct))
+        diligence.pourcentage_avancement = pct
+        diligence.save(update_fields=['pourcentage_avancement'])
+        return Response({'message': 'Progression mise à jour.', 'pourcentage_avancement': float(pct)})
+
+    def create(self, request, *args, **kwargs):
+        # Vérifier les permissions de création
+        user = request.user
+        profile = getattr(user, 'profile', None)
+        
+        if not profile:
+            return Response({'error': 'Profil utilisateur non trouvé'}, status=status.HTTP_403_FORBIDDEN)
+        
+        role = profile.role
+        allowed_roles = ['ADMIN', 'DIRECTEUR', 'SOUS_DIRECTEUR', 'CHEF_SERVICE', 'SUPERIEUR', 'SECRETAIRE']
+        
+        if role not in allowed_roles:
+            return Response({
+                'error': f'Vous n\'avez pas les permissions pour créer une diligence. Rôles autorisés: {", ".join(allowed_roles)}'
+            }, status=status.HTTP_403_FORBIDDEN)
+        
+        # Si un courrier est sélectionné, pré-remplir la direction et le service
+        courrier_id = request.data.get('courrier_id')
+
+        if courrier_id:
+            try:
+                courrier = Courrier.objects.select_related('service__direction').get(id=courrier_id)
+
+                if courrier.service and courrier.service.direction:
+                    if hasattr(request.data, '_mutable'):
+                        request.data._mutable = True
+
+                    if not request.data.get('direction'):
+                        request.data['direction'] = courrier.service.direction.id
+
+                    if not request.data.get('services_concernes_ids'):
+                        request.data['services_concernes_ids'] = [courrier.service.id]
+
+                    if hasattr(request.data, '_mutable'):
+                        request.data._mutable = False
+            except Courrier.DoesNotExist:
+                pass
+            except Exception:
+                pass
+        
+        # Call parent create method
+        response = super().create(request, *args, **kwargs)
+        
+        # Créer des notifications pour les agents assignés
+        if response.status_code == 201:
+            diligence_id = response.data.get('id')
+            if diligence_id:
+                try:
+                    from .models import DiligenceNotification
+                    diligence = Diligence.objects.get(id=diligence_id)
+                    
+                    # Créer une notification pour chaque agent assigné
+                    for agent in diligence.agents.all():
+                        DiligenceNotification.objects.create(
+                            user=agent,
+                            diligence=diligence,
+                            type_notification='nouvelle_diligence',
+                            message=f'Nouvelle diligence assignée: {diligence.reference_courrier}'
+                        )
+                        print(f"Notification créée pour {agent.username} - Diligence {diligence.reference_courrier}")
+                except Exception as e:
+                    print(f"Erreur lors de la création des notifications: {e}")
+        
+        return response
+
+
+
+class CourrierViewSet(viewsets.ModelViewSet):
+    queryset = Courrier.objects.all()
+    serializer_class = CourrierSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+    parser_classes = (MultiPartParser, FormParser, JSONParser)
+
+    def get_queryset(self):
+        from django.db.models import Q
+        user = self.request.user
+        profile = getattr(user, 'profile', None)
+        role = getattr(profile, 'role', None) if profile else None
+
+        queryset = Courrier.objects.select_related(
+            'service',
+            'service__direction',
+            'service__sous_direction',
+            'service__sous_direction__direction',
+        ).all()
+
+        # ── Site isolation (admin reads header, others use own site) ─────────
+        site_id = get_site_id_for_request(self.request)
+        if site_id:
+            site_user_ids = User.objects.filter(
+                profile__site_id=site_id
+            ).values_list('id', flat=True)
+            courrier_ids_via_imputations = CourrierImputation.objects.filter(
+                user_id__in=site_user_ids
+            ).values_list('courrier_id', flat=True)
+            queryset = queryset.filter(id__in=courrier_ids_via_imputations)
+
+        # ── Role-based visibility ─────────────────────────────────────────────
+        if role == 'ADMIN':
+            pass  # Admin sees everything in the selected site
+
+        elif role == 'SECRETAIRE':
+            # Secretary sees only courriers related to their direction/entity.
+            # Priority: profile.direction → profile.service direction → site-only
+            direction_id = None
+            if profile and profile.direction_id:
+                direction_id = profile.direction_id
+            elif profile and profile.service_id:
+                svc = profile.service
+                if getattr(svc, 'sous_direction_id', None) and svc.sous_direction:
+                    direction_id = svc.sous_direction.direction_id
+                elif getattr(svc, 'direction_id', None):
+                    direction_id = svc.direction_id
+
+            if direction_id:
+                queryset = queryset.filter(
+                    Q(service__direction_id=direction_id) |
+                    Q(service__sous_direction__direction_id=direction_id) |
+                    Q(service__isnull=True)  # Courriers sans service rattaché
+                ).distinct()
+
+        elif profile:
+            # Other roles: only courriers explicitly imputed or access-granted
+            imputation_ids = CourrierImputation.objects.filter(
+                user=user
+            ).values_list('courrier_id', flat=True)
+
+            accessible_confidential_ids = CourrierAccess.objects.filter(
+                user=user
+            ).values_list('courrier_id', flat=True)
+
+            all_accessible_ids = list(
+                set(list(accessible_confidential_ids) + list(imputation_ids))
+            )
+            if all_accessible_ids:
+                queryset = queryset.filter(id__in=all_accessible_ids)
+            else:
+                queryset = queryset.none()
+        else:
+            queryset = queryset.filter(type_courrier='ordinaire')
+
+        # ── Query-param filters (type_courrier & sens) ────────────────────────
+        # These allow the mobile/web frontend to filter the list server-side.
+        type_courrier = self.request.query_params.get('type_courrier')
+        sens = self.request.query_params.get('sens')
+        if type_courrier in ('ordinaire', 'confidentiel'):
+            queryset = queryset.filter(type_courrier=type_courrier)
+        if sens in ('arrivee', 'depart'):
+            queryset = queryset.filter(sens=sens)
+
+        return queryset.order_by('-created_at')
+
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        serializer = self.get_serializer(instance)
+        data = serializer.data
+        
+        # Ajout des informations détaillées sur le service et la direction
+        if instance.service:
+            data['service'] = {
+                'id': instance.service.id,
+                'nom': instance.service.nom,
+                'direction': {
+                    'id': instance.service.direction.id,
+                    'nom': instance.service.direction.nom
+                } if instance.service.direction else None
+            }
+        
+        return Response(data)
+
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
+    def create_diligence(self, request, pk=None):
+        """Créer une diligence à partir d'un courrier"""
+        courrier = self.get_object()
+        
+        # Données pour la nouvelle diligence
+        diligence_data = {
+            'reference_courrier': courrier.reference,
+            'courrier': courrier.id,
+            'categorie': request.data.get('categorie', 'NORMAL'),
+            'expediteur': courrier.expediteur,
+            'objet': courrier.objet,
+            'date_reception': courrier.date_reception,
+            'instructions': request.data.get('instructions', ''),
+            'date_limite': request.data.get('date_limite'),
+            'agents': request.data.get('agents', []),
+            'services_concernes': request.data.get('services_concernes', []),
+            'direction': request.data.get('direction')
+        }
+        
+        from .serializers import DiligenceSerializer
+        serializer = DiligenceSerializer(data=diligence_data, context={'request': request})
+        
+        if serializer.is_valid():
+            diligence = serializer.save()
+            return Response({
+                'message': 'Diligence créée avec succès',
+                'diligence_id': diligence.id
+            }, status=status.HTTP_201_CREATED)
+        else:
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
+    def changer_statut(self, request, pk=None):
+        """Changer le statut d'un courrier - accessible à tous les rôles"""
+        courrier = self.get_object()
+        nouveau_statut = request.data.get('statut')
+        
+        if not nouveau_statut:
+            return Response(
+                {'error': 'Le champ statut est requis'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Vérifier que le statut est valide
+        statuts_valides = [choice[0] for choice in Courrier.STATUT_CHOICES]
+        if nouveau_statut not in statuts_valides:
+            return Response(
+                {'error': f'Statut invalide. Valeurs possibles: {", ".join(statuts_valides)}'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        ancien_statut = courrier.statut
+        courrier.statut = nouveau_statut
+        
+        # Si le statut est "traite" ou "termine", définir la date de traitement
+        if nouveau_statut in ['traite', 'termine'] and not courrier.date_traitement:
+            courrier.date_traitement = timezone.now().date()
+        
+        courrier.save()
+        
+        # Créer des notifications pour le changement de statut
+        try:
+            from .models import CourrierNotification
+            from django.contrib.auth import get_user_model
+            User = get_user_model()
+            
+            # Liste des utilisateurs à notifier
+            users_to_notify = set()
+            
+            # 1. Notifier les utilisateurs imputés (sauf celui qui fait le changement)
+            imputations = CourrierImputation.objects.filter(courrier=courrier).select_related('user')
+            for imp in imputations:
+                if imp.user.id != request.user.id:  # Ne pas se notifier soi-même
+                    users_to_notify.add(imp.user)
+            
+            # 2. Notifier les rôles de supervision (ADMIN, DIRECTEUR, SUPERIEUR, CHEF_SERVICE, SECRETAIRE)
+            supervision_roles = ['ADMIN', 'DIRECTEUR', 'SUPERIEUR', 'CHEF_SERVICE', 'SECRETAIRE']
+            supervisors = User.objects.filter(
+                profile__role__in=supervision_roles
+            ).exclude(id=request.user.id)  # Ne pas se notifier soi-même
+            
+            for supervisor in supervisors:
+                users_to_notify.add(supervisor)
+            
+            # Créer les notifications pour tous les utilisateurs concernés
+            for user in users_to_notify:
+                CourrierNotification.objects.create(
+                    utilisateur=user,
+                    courrier=courrier,
+                    type_notification='statut_modifie',
+                    titre=f'Statut du courrier {courrier.reference} modifié',
+                    message=f'Le statut du courrier {courrier.reference} est passé de "{ancien_statut}" à "{nouveau_statut}" par {request.user.get_full_name() or request.user.username}',
+                    priorite='normale'
+                )
+        except Exception as e:
+            print(f'Erreur lors de la création de la notification de changement de statut: {e}')
+        
+        return Response({
+            'message': 'Statut modifié avec succès',
+            'ancien_statut': ancien_statut,
+            'nouveau_statut': nouveau_statut
+        }, status=status.HTTP_200_OK)
+    
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
+    def toggle_rappel_traitement(self, request, pk=None):
+        """Activer/désactiver le rappel de traitement - accessible à tous sauf AGENT"""
+        user = request.user
+        
+        # Vérifier les permissions (tous sauf AGENT)
+        if hasattr(user, 'profile') and user.profile.role == 'AGENT':
+            return Response(
+                {'error': 'Les agents ne peuvent pas activer/désactiver les rappels de traitement'}, 
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        courrier = self.get_object()
+        activer = request.data.get('activer', not courrier.rappel_traitement)
+        ancien_etat = courrier.rappel_traitement
+        
+        courrier.rappel_traitement = activer
+        courrier.save()
+        
+        # Créer une notification si le rappel est activé (et qu'il était désactivé avant)
+        if activer and not ancien_etat:
+            try:
+                from .models import CourrierNotification
+                # Notifier tous les utilisateurs imputés sur ce courrier
+                imputations = CourrierImputation.objects.filter(courrier=courrier).select_related('user')
+                for imp in imputations:
+                    CourrierNotification.objects.create(
+                        utilisateur=imp.user,
+                        courrier=courrier,
+                        type_notification='rappel_traitement',
+                        titre=f'Rappel de traitement activé - {courrier.reference}',
+                        message=f'Un rappel de traitement a été activé pour le courrier {courrier.reference} par {user.get_full_name() or user.username}. Veuillez traiter ce courrier dans les meilleurs délais.',
+                        priorite='haute'
+                    )
+            except Exception as e:
+                print(f'Erreur lors de la création de la notification de rappel: {e}')
+        
+        return Response({
+            'message': f'Rappel de traitement {"activé" if activer else "désactivé"} avec succès',
+            'rappel_traitement': courrier.rappel_traitement
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
+    def imputer_courrier(self, request, pk=None):
+        """Imputer un courrier (ordinaire ou confidentiel) à un utilisateur - ADMIN, SECRETAIRE et DIRECTEUR"""
+        user = request.user
+        
+        # Vérifier les permissions
+        if not (hasattr(user, 'profile') and user.profile.role in ['ADMIN', 'SECRETAIRE', 'DIRECTEUR']):
+            return Response(
+                {'error': 'Seuls les administrateurs, secrétaires et directeurs peuvent imputer des courriers'}, 
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        courrier = self.get_object()
+        
+        user_id = request.data.get('user_id')
+        access_type = request.data.get('access_type', 'view')
+        
+        if not user_id:
+            return Response(
+                {'error': 'user_id est requis'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            target_user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            return Response(
+                {'error': 'Utilisateur non trouvé'}, 
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Créer ou mettre à jour l'imputation
+        imputation, created = CourrierImputation.objects.get_or_create(
+            courrier=courrier,
+            user=target_user,
+            access_type=access_type,
+            defaults={'granted_by': user}
+        )
+        
+        if not created:
+            imputation.granted_by = user
+            imputation.save()
+        
+        courrier_type = 'confidentiel' if courrier.type_courrier == 'confidentiel' else 'ordinaire'
+        return Response({
+            'message': f'Courrier {courrier_type} imputé avec succès à {target_user.get_full_name() or target_user.username}',
+            'imputation_id': imputation.id,
+            'courrier_type': courrier.type_courrier,
+            'sens': courrier.sens
+        }, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['get'], permission_classes=[permissions.IsAuthenticated])
+    def imputations(self, request, pk=None):
+        """Lister toutes les imputations d'un courrier"""
+        courrier = self.get_object()
+        imputations = CourrierImputation.objects.filter(courrier=courrier).select_related('user', 'granted_by')
+        serializer = CourrierImputationSerializer(imputations, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['delete'], permission_classes=[permissions.IsAuthenticated], url_path='imputations/(?P<imputation_id>[^/.]+)')
+    def delete_imputation(self, request, pk=None, imputation_id=None):
+        """Supprimer une imputation spécifique d'un courrier - ADMIN, SECRETAIRE et DIRECTEUR"""
+        user = request.user
+        
+        # Vérifier les permissions
+        if not (hasattr(user, 'profile') and user.profile.role in ['ADMIN', 'SECRETAIRE', 'DIRECTEUR']):
+            return Response(
+                {'error': 'Seuls les administrateurs, secrétaires et directeurs peuvent supprimer des imputations'}, 
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        courrier = self.get_object()
+        
+        try:
+            imputation = CourrierImputation.objects.get(id=imputation_id, courrier=courrier)
+            imputation.delete()
+            return Response(
+                {'message': 'Imputation supprimée avec succès'}, 
+                status=status.HTTP_200_OK
+            )
+        except CourrierImputation.DoesNotExist:
+            return Response(
+                {'error': 'Imputation non trouvée'}, 
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+    def create(self, request, *args, **kwargs):
+        print('\nRequest data:', dict(request.data))
+        print('Files:', dict(request.FILES))
+        try:
+            serializer = self.get_serializer(data=request.data)
+            if not serializer.is_valid():
+                print('\nValidation errors:', serializer.errors)
+                return Response({
+                    'error': 'Validation failed',
+                    'details': serializer.errors
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            self.perform_create(serializer)
+            headers = self.get_success_headers(serializer.data)
+            return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+        except serializers.ValidationError as e:
+            print('\nValidation error:', e.detail)
+            return Response({
+                'error': 'Validation error',
+                'details': e.detail
+            }, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            print('\nUnexpected error:', str(e))
+            print('Type:', type(e))
+            return Response({
+                'error': 'Une erreur inattendue est survenue',
+                'details': str(e)
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+    def list(self, request, *args, **kwargs):
+        response = super().list(request, *args, **kwargs)
+        print('\nAPI Response data:')
+        for item in response.data:
+            print(f'\nCourrier {item["reference"]}:')
+            print('- Full data:', item)
+            if 'service' in item:
+                print('- Service:', item['service'])
+        return response
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        print('Request data:', self.request.data)
+        return context
+
+    def perform_create(self, serializer):
+        serializer.save()
+
+    def perform_update(self, serializer):
+        instance = serializer.save()
+        instance.updated_at = timezone.now()
+        instance.save()
+
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated], url_path='retraiter')
+    def retraiter(self, request, pk=None):
+        """Relance le pipeline OCR/miniature/IA sur un courrier existant."""
+        courrier = self.get_object()
+        if not courrier.fichier_joint:
+            return Response({'error': 'Aucun fichier joint à traiter'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            from core.tasks_courrier import process_courrier_pipeline
+            Courrier.objects.filter(pk=courrier.pk).update(traitement_statut='en_attente')
+            process_courrier_pipeline.delay(courrier.pk)
+            return Response({'message': 'Pipeline de traitement lancé', 'courrier_id': courrier.pk})
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=True, methods=['get'])
+    def services(self, request, pk=None):
+        direction = self.get_object()
+        services = direction.services.all()
+        serializer = ServiceSerializer(services, many=True)
+        return Response(serializer.data)
+
+from django.http import FileResponse, Http404
+from rest_framework.views import APIView
+
+class DiligenceDownloadFichierView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+    
+    def get(self, request, pk):
+        from .models import Diligence, ImputationAccess
+        try:
+            diligence = Diligence.objects.get(pk=pk)
+            # Vérification d'accès ImputationAccess
+            if not ImputationAccess.objects.filter(diligence=diligence, user=request.user).exists():
+                return Response({'detail': 'Accès refusé : vous n\'avez pas l\'autorisation pour ce document.'}, status=403)
+            if not diligence.fichier_joint:
+                raise Http404("Aucun fichier joint")
+            response = FileResponse(diligence.fichier_joint.open('rb'), as_attachment=True, filename=diligence.fichier_joint.name.split('/')[-1])
+            return response
+        except Diligence.DoesNotExist:
+            raise Http404("Diligence non trouvée")
+
+from rest_framework import viewsets, permissions
+from .models import ImputationAccess
+from .serializers import ImputationAccessSerializer
+
+class ImputationAccessViewSet(viewsets.ModelViewSet):
+    queryset = ImputationAccess.objects.all()
+    serializer_class = ImputationAccessSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+    
+    def get_queryset(self):
+        queryset = ImputationAccess.objects.all()
+        user_id = self.request.query_params.get('user', None)
+        diligence_id = self.request.query_params.get('diligence', None)
+        
+        if user_id is not None:
+            queryset = queryset.filter(user=user_id)
+        if diligence_id is not None:
+            queryset = queryset.filter(diligence=diligence_id)
+            
+        return queryset
+    
+    def create(self, request, *args, **kwargs):
+        response = super().create(request, *args, **kwargs)
+        
+        # Créer une notification pour l'utilisateur imputé
+        if response.status_code == 201:
+            try:
+                from .models import DiligenceNotification
+                imputation_access = ImputationAccess.objects.get(id=response.data['id'])
+                
+                DiligenceNotification.objects.create(
+                    user=imputation_access.user,
+                    diligence=imputation_access.diligence,
+                    type_notification='nouvelle_diligence',
+                    message=f'Vous avez été imputé sur la diligence: {imputation_access.diligence.reference_courrier}'
+                )
+                print(f"Notification d'imputation créée pour {imputation_access.user.username}")
+            except Exception as e:
+                print(f"Erreur lors de la création de la notification d'imputation: {e}")
+        
+        return response
+
+class BureauViewSet(viewsets.ModelViewSet):
+    queryset = Bureau.objects.all()
+    serializer_class = BureauSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    @action(detail=True, methods=['get'])
+    def notifications(self, request, pk=None):
+        bureau = self.get_object()
+        notifications = Notification.objects.filter(bureau=bureau)
+        serializer = NotificationSerializer(notifications, many=True)
+        return Response(serializer.data)
+
+class CustomTokenObtainPairView(APIView):
+    permission_classes = [permissions.AllowAny]
+    def post(self, request, *args, **kwargs):
+        print("CUSTOM JWT VIEW: appelée !")
+        print("CUSTOM JWT VIEW: avant instanciation serializer")
+        print("MyTokenObtainPairSerializer =", MyTokenObtainPairSerializer, "from", MyTokenObtainPairSerializer.__module__)
+        serializer = MyTokenObtainPairSerializer(data=request.data)
+        print("CUSTOM JWT VIEW: après instanciation serializer")
+        print("CUSTOM JWT VIEW: juste avant serializer.is_valid()")
+        print("CUSTOM JWT VIEW: request.data =", request.data)
+        try:
+            is_valid = serializer.is_valid()
+            print("CUSTOM JWT VIEW: juste après serializer.is_valid(), résultat:", is_valid)
+        except Exception as e:
+            print("CUSTOM JWT VIEW: EXCEPTION lors de serializer.is_valid():", repr(e))
+            import traceback; traceback.print_exc()
+            return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        if is_valid:
+            print("CUSTOM JWT VIEW: serializer OK")
+            return Response(serializer.validated_data, status=status.HTTP_200_OK)
+        else:
+            print("CUSTOM JWT VIEW: serializer NON valide")
+            print("CUSTOM JWT VIEW: erreurs serializer:", serializer.errors)
+            return Response(serializer.errors, status=status.HTTP_401_UNAUTHORIZED)
+
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        diligence_id = self.request.query_params.get('diligence')
+        user_id = self.request.query_params.get('user')
+        if diligence_id:
+            queryset = queryset.filter(diligence_id=diligence_id)
+        if user_id:
+            queryset = queryset.filter(user_id=user_id)
+        return queryset
+
+    def perform_create(self, serializer):
+        # Optionnel : associe l'utilisateur créateur si utile
+        serializer.save()
+
+# --- Presence CRUD API ---
+
+from rest_framework.permissions import IsAdminUser
+
+class ListUsersView(APIView):
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    def get(self, request):
+        users = User.objects.select_related('profile', 'profile__service', 'profile__service__sous_direction', 'profile__direction', 'profile__sous_direction').all()
+        serializer = UserSerializer(users, many=True)
+        return Response(serializer.data)
+
+class RetrieveUserView(APIView):
+    permission_classes = [IsAdminUser]
+    authentication_classes = [JWTAuthentication]
+
+    def get(self, request, user_id):
+        try:
+            user = User.objects.get(id=user_id)
+            data = {
+                'id': user.id,
+                'username': user.username,
+                'email': user.email,
+                'first_name': user.first_name,
+                'last_name': user.last_name,
+                'is_active': user.is_active,
+                'date_joined': user.date_joined,
+            }
+            return Response(data)
+        except User.DoesNotExist:
+            return Response({'error': 'Utilisateur non trouvé.'}, status=status.HTTP_404_NOT_FOUND)
+
+class DeleteUserView(APIView):
+    permission_classes = [IsAdminUser]
+    authentication_classes = [JWTAuthentication]
+
+    def delete(self, request, user_id):
+        try:
+            user = User.objects.get(id=user_id)
+            user.delete()
+            return Response({'detail': 'Utilisateur supprimé.'}, status=status.HTTP_204_NO_CONTENT)
+        except User.DoesNotExist:
+            return Response({'error': 'Utilisateur non trouvé.'}, status=status.HTTP_404_NOT_FOUND)
+
+class MaPresenceDuJourView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    def get(self, request):
+        user = request.user
+        try:
+            agent = Agent.objects.get(user=user)
+        except Agent.DoesNotExist:
+            return Response(None, status=status.HTTP_404_NOT_FOUND)
+        
+        today = date.today()
+        
+        # Chercher la présence du jour
+        try:
+            presence = Presence.objects.get(agent=agent, date_presence=today)
+            serializer = PresenceSerializer(presence)
+            return Response(serializer.data)
+        except Presence.DoesNotExist:
+            # Aucune présence trouvée pour aujourd'hui
+            return Response(None, status=status.HTTP_404_NOT_FOUND)
+
+class MesPresencesView(APIView):
+    """Retourne l'historique de présence de l'utilisateur connecté"""
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    def get(self, request):
+        import logging
+        logger = logging.getLogger(__name__)
+        user = request.user
+        try:
+            agent = Agent.objects.get(user=user)
+        except Agent.DoesNotExist:
+            return Response([], status=status.HTTP_200_OK)
+
+        qs = Presence.objects.filter(agent=agent)
+
+        mois = request.query_params.get('mois')  # format: YYYY-MM
+        if mois:
+            try:
+                year_str, month_str = mois.split('-')
+                qs = qs.filter(
+                    date_presence__year=int(year_str),
+                    date_presence__month=int(month_str)
+                )
+            except (ValueError, AttributeError):
+                pass
+
+        qs = qs.order_by('-date_presence')
+
+        data = []
+        for p in qs:
+            arrivee = str(p.heure_arrivee) if p.heure_arrivee else None
+            depart = str(p.heure_depart) if p.heure_depart else None
+            # Calculer la durée en minutes
+            duree = None
+            if arrivee and depart:
+                try:
+                    ah, am = int(arrivee[:2]), int(arrivee[3:5])
+                    dh, dm = int(depart[:2]), int(depart[3:5])
+                    duree = (dh * 60 + dm) - (ah * 60 + am)
+                    if duree < 0:
+                        duree = None
+                except (ValueError, IndexError):
+                    pass
+            # Retard si arrivée après 8h00
+            est_en_retard = False
+            if arrivee:
+                try:
+                    ah, am = int(arrivee[:2]), int(arrivee[3:5])
+                    est_en_retard = (ah * 60 + am) > (8 * 60)
+                except (ValueError, IndexError):
+                    pass
+
+            bureau_nom = None
+            if agent.bureau:
+                bureau_nom = agent.bureau.nom
+            elif hasattr(user, 'profile') and user.profile.site:
+                bureau_nom = user.profile.site.nom
+
+            data.append({
+                'id': p.id,
+                'date': str(p.date_presence),
+                'heure_arrivee': arrivee,
+                'heure_depart': depart,
+                'duree_minutes': duree,
+                'statut': p.statut,
+                'est_en_retard': est_en_retard,
+                'bureau_nom': bureau_nom,
+            })
+
+        logger.info(f'[MesPresencesView] {user.username} — {len(data)} entrées pour mois={mois}')
+        return Response(data)
+
+
+# Imports déjà présents en haut du fichier - suppression des doublons
+
+# PresenceFingerprintView removed - using simple button presence now
+
+class SimplePresenceView(APIView):
+    """API simplifiée pour pointage par bouton mobile"""
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [JWTAuthentication, TokenAuthentication]
+
+    def post(self, request):
+        import logging
+        from datetime import date, datetime
+        from django.utils.dateparse import parse_datetime
+        from django.utils import timezone
+        from .models import Agent, Presence
+
+        logger = logging.getLogger(__name__)
+        user = request.user
+        action = request.data.get('action')  # 'arrivee' ou 'depart'
+        latitude = request.data.get('latitude')
+        longitude = request.data.get('longitude')
+        captured_at_raw = request.data.get('captured_at')  # horodatage réel de capture (optionnel, hors-ligne)
+
+        logger.info(f'[SimplePresenceView] User: {user}, Action: {action}')
+        
+        if not action or action not in ['arrivee', 'depart']:
+            return Response({'error': 'Action requise: arrivee ou depart'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        if not latitude or not longitude:
+            return Response({'error': 'Position GPS requise'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Coordonnées réelles — aucune correction automatique
+        corrected_latitude = latitude
+        corrected_longitude = longitude
+
+        try:
+            # Récupérer ou créer l'agent automatiquement
+            agent, created = Agent.objects.get_or_create(
+                user=user,
+                defaults={
+                    'nom': user.last_name or 'Nom',
+                    'prenom': user.first_name or 'Prénom',
+                    'matricule': f'A{user.id:04d}',
+                    'poste': getattr(user.profile, 'role', 'AGENT') if hasattr(user, 'profile') else 'AGENT'
+                }
+            )
+
+            # ── Résolution du point de référence GPS ──────────────────────────
+            # Priorité 1 : palier actif du site (UserProfile.site)
+            # Priorité 2 : coordonnées GPS directes du site
+            # Priorité 3 : bureau de l'Agent (fallback)
+            # Identique à la logique du mobile (gpsRef)
+            from .models import SitePalier
+            from math import radians, cos, sin, asin, sqrt
+
+            def haversine(lat1, lon1, lat2, lon2):
+                R = 6371000
+                phi1 = radians(lat1); phi2 = radians(lat2)
+                dphi = radians(lat2 - lat1); dlambda = radians(lon2 - lon1)
+                a = sin(dphi/2)**2 + cos(phi1)*cos(phi2)*sin(dlambda/2)**2
+                return R * 2 * asin(sqrt(a))
+
+            ref_lat = ref_lon = ref_rayon = None
+            ref_nom = None
+
+            user_profile = getattr(user, 'profile', None)
+            user_site = getattr(user_profile, 'site', None) if user_profile else None
+
+            if user_site:
+                # Priorité 1 : palier actif avec coordonnées GPS
+                palier = SitePalier.objects.filter(
+                    site=user_site, est_actif=True,
+                    latitude__isnull=False, longitude__isnull=False
+                ).order_by('ordre').first()
+                if palier:
+                    ref_lat   = float(palier.latitude)
+                    ref_lon   = float(palier.longitude)
+                    ref_rayon = float(palier.rayon_pointage)
+                    ref_nom   = f"{user_site.nom} — {palier.nom}"
+                elif user_site.latitude and user_site.longitude:
+                    # Priorité 2 : coordonnées GPS directes du site
+                    ref_lat   = float(user_site.latitude)
+                    ref_lon   = float(user_site.longitude)
+                    ref_rayon = float(user_site.rayon_pointage)
+                    ref_nom   = user_site.nom
+
+            # Priorité 3 : bureau de l'Agent (fallback)
+            if ref_lat is None and agent.bureau and agent.bureau.latitude_centre and agent.bureau.longitude_centre:
+                b = agent.bureau
+                ref_lat   = float(b.latitude_centre)
+                ref_lon   = float(b.longitude_centre)
+                ref_rayon = float(b.rayon_metres) if b.rayon_metres else 100.0
+                ref_nom   = user_site.nom if user_site else b.nom
+
+            if ref_lat is not None and ref_lon is not None:
+                distance = haversine(
+                    float(corrected_latitude), float(corrected_longitude),
+                    ref_lat, ref_lon
+                )
+                logger.info(f'[SimplePresenceView] Distance vers {ref_nom}: {distance:.1f}m (rayon: {ref_rayon}m)')
+
+                if distance > ref_rayon:
+                    return Response({
+                        'error': f'Vous êtes hors de la zone autorisée pour {ref_nom} ({distance:.1f}m > {ref_rayon:.1f}m). Veuillez vous rapprocher de votre lieu de travail.',
+                        'distance': round(distance, 1),
+                        'rayon_autorise': ref_rayon,
+                        'site': ref_nom
+                    }, status=status.HTTP_400_BAD_REQUEST)
+            else:
+                logger.warning(f'[SimplePresenceView] Aucune configuration GPS pour {user.username} — pointage sans validation géographique')
+            
+            if created:
+                logger.info(f'[SimplePresenceView] Agent créé automatiquement pour {user.username}')
+            
+            captured_at = parse_datetime(captured_at_raw) if captured_at_raw else None
+            if captured_at and timezone.is_naive(captured_at):
+                captured_at = timezone.make_aware(captured_at, timezone.get_current_timezone())
+            reference_dt = timezone.localtime(captured_at) if captured_at else datetime.now()
+            today = reference_dt.date()
+            current_time = reference_dt.time()
+
+            # Récupérer ou créer la présence du jour
+            presence, created = Presence.objects.get_or_create(
+                agent=agent,
+                date_presence=today,
+                defaults={
+                    'statut': 'présent',
+                    'latitude': corrected_latitude,
+                    'longitude': corrected_longitude,
+                    'localisation_valide': True,
+                    'captured_at': captured_at,
+                }
+            )
+            
+            if action == 'arrivee':
+                if presence.heure_arrivee:
+                    return Response({'error': 'Arrivée déjà enregistrée aujourd\'hui'}, status=status.HTTP_400_BAD_REQUEST)
+                
+                # Vérification et ajustement de l'heure d'arrivée
+                from datetime import time as dt_time
+                heure_limite_arrivee = dt_time(7, 30)  # 7h30
+                
+                if current_time < heure_limite_arrivee:
+                    # Si pointage avant 7h30, ajuster à 7h30
+                    presence.heure_arrivee = heure_limite_arrivee
+                    message = f'Arrivée enregistrée à 07:30 (pointage effectué à {current_time.strftime("%H:%M")})'
+                    logger.info(f'[SimplePresenceView] Pointage avant 7h30 ajusté: {current_time.strftime("%H:%M")} -> 07:30 pour {user.username}')
+                else:
+                    presence.heure_arrivee = current_time
+                    message = 'Arrivée enregistrée avec succès'
+            
+            elif action == 'depart':
+                if not presence.heure_arrivee:
+                    return Response({'error': 'Vous devez d\'abord pointer votre arrivée'}, status=status.HTTP_400_BAD_REQUEST)
+                if presence.heure_depart:
+                    return Response({'error': 'Départ déjà enregistré aujourd\'hui'}, status=status.HTTP_400_BAD_REQUEST)
+                presence.heure_depart = current_time
+                message = 'Départ enregistré avec succès'
+            
+            presence.save()
+
+            # --- Notification aux admins/supérieurs du même site ---
+            try:
+                from .models import Notification, UserProfile
+                agent_nom = f"{agent.prenom or ''} {agent.nom}".strip() or user.username
+                heure_str = current_time.strftime('%H:%M')
+                action_label = 'arrivée' if action == 'arrivee' else 'départ'
+                notif_message = f"Pointage {action_label} — {agent_nom} à {heure_str}"
+                # Notifier les admins et responsables du même site
+                admin_roles = ['ADMIN', 'DIRECTEUR', 'SOUS_DIRECTEUR', 'CHEF_SERVICE', 'SUPERIEUR']
+                supervisors = User.objects.filter(
+                    profile__role__in=admin_roles
+                )
+                if user_site:
+                    supervisors = supervisors.filter(profile__site=user_site)
+                for supervisor in supervisors.exclude(id=user.id):
+                    Notification.objects.create(
+                        user=supervisor,
+                        message=notif_message,
+                    )
+            except Exception as notif_err:
+                logger.warning(f'[SimplePresenceView] Notification error: {notif_err}')
+
+            return Response({
+                'success': True,
+                'message': message,
+                'presence': {
+                    'date': presence.date_presence,
+                    'heure_arrivee': presence.heure_arrivee,
+                    'heure_depart': presence.heure_depart,
+                    'statut': presence.statut
+                }
+            }, status=status.HTTP_200_OK)
+            
+        except Agent.DoesNotExist:
+            return Response({'error': 'Profil agent non trouvé'}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            logger.error(f'[SimplePresenceView] Erreur: {str(e)}')
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+class PresenceSyncView(APIView):
+    """
+    Synchronisation par lot des pointages capturés hors-ligne par l'app mobile.
+
+    Reçoit {items: [{local_id, action, latitude, longitude, captured_at, device_fingerprint?}, ...]}
+    et traite chaque item indépendamment (même validation géofence que
+    SimplePresenceView, mais appliquée à captured_at plutôt qu'à now()).
+    L'idempotence est assurée par get_or_create sur local_id : rejouer le même
+    item (retry réseau, double flush de la file mobile) ne crée jamais de doublon.
+
+    Réponse : {results: [{local_id, status: "accepted"|"rejected", reason?, presence?}, ...]}
+    afin que le mobile ne retire de sa file locale que les items acceptés.
+    """
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [JWTAuthentication, TokenAuthentication]
+
+    def post(self, request):
+        import logging
+        from datetime import date, datetime, time as dt_time
+        from django.utils.dateparse import parse_datetime
+        from django.utils import timezone
+        from .models import Agent, Presence
+        from .geofencing_utils import calculate_distance, get_gps_reference_for_user
+
+        logger = logging.getLogger(__name__)
+        user = request.user
+        items = request.data.get('items')
+
+        if not isinstance(items, list) or not items:
+            return Response({'error': 'items requis (liste non vide)'}, status=status.HTTP_400_BAD_REQUEST)
+
+        agent, _created = Agent.objects.get_or_create(
+            user=user,
+            defaults={
+                'nom': user.last_name or 'Nom',
+                'prenom': user.first_name or 'Prénom',
+                'matricule': f'A{user.id:04d}',
+                'poste': getattr(user.profile, 'role', 'AGENT') if hasattr(user, 'profile') else 'AGENT'
+            }
+        )
+        gps_ref = get_gps_reference_for_user(user)
+
+        results = []
+
+        for item in items:
+            local_id = item.get('local_id')
+            action = item.get('action')
+            latitude = item.get('latitude')
+            longitude = item.get('longitude')
+            captured_at_raw = item.get('captured_at')
+
+            if not local_id:
+                results.append({'local_id': local_id, 'status': 'rejected', 'reason': 'local_id requis'})
+                continue
+            if action not in ('arrivee', 'depart'):
+                results.append({'local_id': local_id, 'status': 'rejected', 'reason': 'Action requise: arrivee ou depart'})
+                continue
+            if latitude is None or longitude is None:
+                results.append({'local_id': local_id, 'status': 'rejected', 'reason': 'Position GPS requise'})
+                continue
+
+            # Idempotence : un local_id déjà synchronisé est renvoyé accepté sans retraitement
+            existing = Presence.objects.filter(local_id=local_id).first()
+            if existing:
+                results.append({
+                    'local_id': local_id,
+                    'status': 'accepted',
+                    'presence': {
+                        'date': existing.date_presence,
+                        'heure_arrivee': existing.heure_arrivee,
+                        'heure_depart': existing.heure_depart,
+                        'statut': existing.statut,
+                    }
+                })
+                continue
+
+            captured_at = parse_datetime(captured_at_raw) if captured_at_raw else None
+            if captured_at and timezone.is_naive(captured_at):
+                captured_at = timezone.make_aware(captured_at, timezone.get_current_timezone())
+            reference_dt = timezone.localtime(captured_at) if captured_at else timezone.localtime(timezone.now())
+            today = reference_dt.date()
+            current_time = reference_dt.time()
+
+            if gps_ref is not None:
+                distance = calculate_distance(
+                    float(latitude), float(longitude),
+                    gps_ref['latitude'], gps_ref['longitude']
+                )
+                if distance > gps_ref['rayon_metres']:
+                    results.append({
+                        'local_id': local_id,
+                        'status': 'rejected',
+                        'reason': f"Hors de la zone autorisée pour {gps_ref['nom']} ({distance:.1f}m > {gps_ref['rayon_metres']:.1f}m)",
+                        'distance': round(distance, 1),
+                        'rayon_autorise': gps_ref['rayon_metres'],
+                    })
+                    continue
+            else:
+                logger.warning(f'[PresenceSyncView] Aucune configuration GPS pour {user.username} — pointage sans validation géographique')
+
+            presence, presence_created = Presence.objects.get_or_create(
+                agent=agent,
+                date_presence=today,
+                defaults={
+                    'statut': 'présent',
+                    'latitude': latitude,
+                    'longitude': longitude,
+                    'localisation_valide': True,
+                    'local_id': local_id,
+                    'captured_at': captured_at,
+                }
+            )
+
+            # Une présence couvre à la fois l'arrivée et le départ (une seule ligne
+            # par agent/jour) : "déjà enregistré" ne peut donc pas se détecter par
+            # local_id (celui-ci n'identifie qu'un seul des deux évènements). On
+            # traite l'état déjà atteint comme un succès idempotent — la resynchro-
+            # nisation d'un item déjà traité doit être acceptée, pas rejetée, sans
+            # quoi le mobile le retenterait indéfiniment sans jamais réussir.
+            if action == 'arrivee':
+                if presence.heure_arrivee:
+                    results.append({
+                        'local_id': local_id, 'status': 'accepted',
+                        'presence': {
+                            'date': presence.date_presence, 'heure_arrivee': presence.heure_arrivee,
+                            'heure_depart': presence.heure_depart, 'statut': presence.statut,
+                        }
+                    })
+                    continue
+                heure_limite_arrivee = dt_time(7, 30)
+                if current_time < heure_limite_arrivee:
+                    presence.heure_arrivee = heure_limite_arrivee
+                else:
+                    presence.heure_arrivee = current_time
+            else:  # depart
+                if not presence.heure_arrivee:
+                    results.append({'local_id': local_id, 'status': 'rejected', 'reason': "Vous devez d'abord pointer votre arrivée"})
+                    continue
+                if presence.heure_depart:
+                    results.append({
+                        'local_id': local_id, 'status': 'accepted',
+                        'presence': {
+                            'date': presence.date_presence, 'heure_arrivee': presence.heure_arrivee,
+                            'heure_depart': presence.heure_depart, 'statut': presence.statut,
+                        }
+                    })
+                    continue
+                presence.heure_depart = current_time
+
+            presence.save()
+
+            try:
+                from .models import Notification
+                agent_nom = f"{agent.prenom or ''} {agent.nom}".strip() or user.username
+                action_label = 'arrivée' if action == 'arrivee' else 'départ'
+                notif_message = f"Pointage {action_label} — {agent_nom} à {current_time.strftime('%H:%M')} (synchronisé)"
+                admin_roles = ['ADMIN', 'DIRECTEUR', 'SOUS_DIRECTEUR', 'CHEF_SERVICE', 'SUPERIEUR']
+                user_profile = getattr(user, 'profile', None)
+                user_site = getattr(user_profile, 'site', None) if user_profile else None
+                supervisors = User.objects.filter(profile__role__in=admin_roles)
+                if user_site:
+                    supervisors = supervisors.filter(profile__site=user_site)
+                for supervisor in supervisors.exclude(id=user.id):
+                    Notification.objects.create(user=supervisor, message=notif_message)
+            except Exception as notif_err:
+                logger.warning(f'[PresenceSyncView] Notification error: {notif_err}')
+
+            results.append({
+                'local_id': local_id,
+                'status': 'accepted',
+                'presence': {
+                    'date': presence.date_presence,
+                    'heure_arrivee': presence.heure_arrivee,
+                    'heure_depart': presence.heure_depart,
+                    'statut': presence.statut,
+                }
+            })
+
+        return Response({'results': results}, status=status.HTTP_200_OK)
+
+
+class UpdatePresenceStatusView(APIView):
+    """API pour que les supérieurs modifient le statut des présences"""
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [JWTAuthentication, TokenAuthentication]
+
+    def patch(self, request, presence_id):
+        try:
+            presence = Presence.objects.get(id=presence_id)
+            new_status = request.data.get('statut')
+            
+            if new_status not in ['présent', 'absent']:
+                return Response({'error': 'Statut invalide'}, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Vérifier que l'utilisateur a le droit de modifier (supérieur hiérarchique)
+            user_profile = request.user.profile
+            if user_profile.role not in ['ADMIN', 'DIRECTEUR', 'SOUS_DIRECTEUR', 'CHEF_SERVICE']:
+                return Response({'error': 'Permissions insuffisantes'}, status=status.HTTP_403_FORBIDDEN)
+            
+            # Mettre à jour le statut
+            presence.statut = new_status
+            presence.statut_modifiable = True
+            
+            # Si on remet présent, on réactive la possibilité de pointer départ
+            if new_status == 'présent':
+                presence.sortie_detectee = False
+                presence.heure_sortie = None
+                presence.temps_absence_minutes = None
+            
+            presence.save()
+            
+            # Obtenir le nom de l'agent correctement
+            agent_name = presence.agent.user.username if hasattr(presence.agent, 'user') else str(presence.agent)
+            logger.info(f'[UpdatePresenceStatus] Statut modifié par {request.user.username}: {agent_name} -> {new_status}')
+            
+            return Response({
+                'message': f'Statut mis à jour: {new_status}',
+                'presence_id': presence.id,
+                'nouveau_statut': new_status
+            })
+            
+        except Presence.DoesNotExist:
+            return Response({'error': 'Présence non trouvée'}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            logger.error(f'[UpdatePresenceStatus] Erreur: {str(e)}')
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+class OccurrenceSpecialeViewSet(viewsets.ModelViewSet):
+    queryset = OccurrenceSpeciale.objects.all()
+    serializer_class = OccurrenceSpecialeSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+    
+    def get_queryset(self):
+        """Filtrer les occurrences selon le rôle de l'utilisateur"""
+        user = self.request.user
+        
+        # Les supérieurs peuvent voir toutes les occurrences de leur service/direction
+        if hasattr(user, 'profile') and user.profile.role in ['ADMIN', 'DIRECTEUR', 'SOUS_DIRECTEUR', 'CHEF_SERVICE']:
+            return OccurrenceSpeciale.objects.all()
+        
+        # Les agents voient seulement leurs propres occurrences
+        return OccurrenceSpeciale.objects.filter(agent=user)
+
+
+class PresencePagination(PageNumberPagination):
+    page_size = 50
+    page_size_query_param = 'per_page'
+    max_page_size = 200
+
+class PresenceViewSet(viewsets.ModelViewSet):
+    queryset = Presence.objects.all()
+    serializer_class = PresenceSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+    pagination_class = PresencePagination
+
+    def get_queryset(self):
+        qs = Presence.objects.select_related(
+            'agent', 'agent__user__profile',
+            'agent__service', 'agent__service__sous_direction',
+            'agent__service__sous_direction__direction'
+        ).all()
+        site_id = get_site_id_for_request(self.request)
+        if site_id:
+            qs = qs.filter(agent__user__profile__site_id=site_id)
+        # Allow filtering by specific user
+        user_id = self.request.query_params.get('user') or self.request.query_params.get('agent')
+        if user_id:
+            qs = qs.filter(agent_id=user_id)
+        date_param = self.request.query_params.get('date')
+        if date_param:
+            qs = qs.filter(date_presence=date_param)
+        start_date = self.request.query_params.get('start_date')
+        end_date = self.request.query_params.get('end_date')
+        if start_date:
+            qs = qs.filter(date_presence__gte=start_date)
+        if end_date:
+            qs = qs.filter(date_presence__lte=end_date)
+        return qs.order_by('-date_presence', '-heure_arrivee')
+
+    def perform_create(self, serializer):
+        import logging
+        logger = logging.getLogger(__name__)
+        from rest_framework.exceptions import ValidationError
+        from math import radians, cos, sin, asin, sqrt
+        from .models import Agent
+        logger.warning('[PresenceViewSet] Données reçues: %s', self.request.data)
+        user = self.request.user
+        statut = 'présent'
+        user_id = self.request.data.get('user_id')
+        if user_id:
+            try:
+                agent_user = User.objects.get(id=user_id)
+            except User.DoesNotExist:
+                agent_user = self.request.user
+        else:
+            agent_user = self.request.user
+
+        # Récupérer le profil Agent
+        try:
+            agent_obj = Agent.objects.get(user=agent_user)
+        except Agent.DoesNotExist:
+            logger.error('[PresenceViewSet] Aucun profil Agent associé à cet utilisateur.')
+            raise ValidationError('Aucun profil Agent associé à cet utilisateur.')
+
+        latitude = self.request.data.get('latitude')
+        longitude = self.request.data.get('longitude')
+        commentaire = self.request.data.get('commentaire')
+        device_fingerprint = self.request.data.get('device_fingerprint')
+
+        localisation_valide = False
+        commentaire_final = commentaire or ''
+
+        # ── Résolution du point de référence GPS ──────────────────────────────
+        # Priorité 1 : palier actif du site (UserProfile.site) avec coordonnées GPS
+        # Priorité 2 : coordonnées GPS directes du site (UserProfile.site)
+        # Priorité 3 : bureau de l'Agent en fallback (seulement si aucun GPS sur le site)
+        # Cette logique est identique à celle du mobile (gpsRef)
+        from .models import SitePalier
+
+        def haversine(lat1, lon1, lat2, lon2):
+            R = 6371000
+            phi1 = radians(lat1); phi2 = radians(lat2)
+            dphi = radians(lat2 - lat1); dlambda = radians(lon2 - lon1)
+            a = sin(dphi/2)**2 + cos(phi1)*cos(phi2)*sin(dlambda/2)**2
+            return R * 2 * asin(sqrt(a))
+
+        ref_lat = ref_lon = ref_rayon = None
+        ref_nom = None
+
+        # Récupérer le site depuis UserProfile
+        user_profile = getattr(agent_user, 'profile', None)
+        user_site = getattr(user_profile, 'site', None) if user_profile else None
+
+        if user_site:
+            # Priorité 1 : palier actif avec coordonnées GPS
+            palier = SitePalier.objects.filter(
+                site=user_site, est_actif=True,
+                latitude__isnull=False, longitude__isnull=False
+            ).order_by('ordre').first()
+            if palier:
+                ref_lat   = float(palier.latitude)
+                ref_lon   = float(palier.longitude)
+                ref_rayon = float(palier.rayon_pointage)
+                ref_nom   = f"{user_site.nom} — {palier.nom}"
+            elif user_site.latitude and user_site.longitude:
+                # Priorité 2 : coordonnées GPS directes du site
+                ref_lat   = float(user_site.latitude)
+                ref_lon   = float(user_site.longitude)
+                ref_rayon = float(user_site.rayon_pointage)
+                ref_nom   = user_site.nom
+
+        # Priorité 3 : bureau de l'Agent (fallback uniquement si pas de GPS sur le site)
+        if ref_lat is None and agent_obj.bureau and agent_obj.bureau.latitude_centre and agent_obj.bureau.longitude_centre:
+            b = agent_obj.bureau
+            ref_lat   = float(b.latitude_centre)
+            ref_lon   = float(b.longitude_centre)
+            ref_rayon = float(b.rayon_metres) if b.rayon_metres else 100.0
+            # Afficher le nom du site même si on utilise les coords du bureau
+            ref_nom   = user_site.nom if user_site else b.nom
+
+        if ref_lat is not None and ref_lon is not None:
+            try:
+                lat1 = float(latitude)
+                lon1 = float(longitude)
+                distance = haversine(lat1, lon1, ref_lat, ref_lon)
+                logger.warning('[PresenceViewSet] Distance vers %s : %.1f m (rayon : %.1f m)', ref_nom, distance, ref_rayon)
+                if distance > ref_rayon:
+                    raise ValidationError({'error': (
+                        f"Vous êtes hors de la zone autorisée pour {ref_nom} "
+                        f"({distance:.1f} m > {ref_rayon:.1f} m). "
+                        f"Veuillez vous rapprocher de votre lieu de travail."
+                    )})
+                localisation_valide = True
+            except ValidationError:
+                raise
+            except Exception as e:
+                logger.error('[PresenceViewSet] Erreur validation GPS: %s', str(e))
+                raise ValidationError(f"Erreur lors de la validation GPS : {str(e)}")
+        else:
+            commentaire_final += " [Avertissement : aucune configuration GPS de zone autorisée sur votre profil.]"
+
+        # Vérification de l'empreinte du téléphone
+        logger.info('[PresenceViewSet] Device fingerprint reçu: %s', device_fingerprint)
+        if device_fingerprint:
+            from .models import DeviceRegistration
+            
+            logger.info('[PresenceViewSet] Vérification device fingerprint: %s pour utilisateur: %s', device_fingerprint[:8], agent_user.username)
+            
+            # Vérifier si cet appareil est déjà utilisé par un autre utilisateur
+            existing_device = DeviceRegistration.objects.filter(
+                device_fingerprint=device_fingerprint,
+                is_active=True
+            ).exclude(user=agent_user).first()
+            
+            if existing_device:
+                logger.warning('[PresenceViewSet] 🚫 RESTRICTION ACTIVÉE - Appareil %s déjà utilisé par %s, refus pour %s', 
+                             device_fingerprint[:8], existing_device.user.username, agent_user.username)
+                raise ValidationError({
+                    'error': f'Cet appareil est déjà enregistré pour {existing_device.user.username}. Chaque téléphone ne peut être utilisé que par un seul agent.'
+                })
+            
+            # Enregistrer ou mettre à jour l'appareil pour cet utilisateur
+            device_reg, created = DeviceRegistration.objects.get_or_create(
+                user=agent_user,
+                device_fingerprint=device_fingerprint,
+                defaults={
+                    'device_name': f'Mobile {Platform.OS}' if 'Platform' in globals() else 'Mobile',
+                    'is_active': True
+                }
+            )
+            
+            if not created:
+                # Mettre à jour la date de dernière utilisation
+                device_reg.last_used = timezone.now()
+                device_reg.save()
+                logger.info('[PresenceViewSet] ✅ Appareil existant mis à jour: %s pour %s', device_fingerprint[:8], agent_user.username)
+            else:
+                logger.info('[PresenceViewSet] ✅ Nouvel appareil enregistré: %s pour %s', device_fingerprint[:8], agent_user.username)
+        else:
+            logger.warning('[PresenceViewSet] ⚠️ Aucune empreinte device reçue - restriction non appliquée')
+
+        logger.info('[PresenceViewSet] Création de la présence pour agent=%s', agent_obj)
+        serializer.save(
+            agent=agent_obj,
+            statut=statut,
+            localisation_valide=localisation_valide,
+            latitude=latitude,
+            longitude=longitude,
+            device_fingerprint=device_fingerprint,
+            commentaire=commentaire_final
+        )
+
+    def partial_update(self, request, *args, **kwargs):
+        # Multi-sites désactivé : gestion entreprise supprimée pour le départ
+        return super().partial_update(request, *args, **kwargs)
+
+    @action(detail=True, methods=['get'], url_path='trace_absence',
+            permission_classes=[permissions.IsAuthenticated],
+            authentication_classes=[JWTAuthentication])
+    def trace_absence(self, request, pk=None):
+        """
+        Retourne la trace GPS et la dernière position connue d'un agent pour
+        une absence prolongée (>1h) détectée automatiquement sur cette présence.
+        """
+        presence = self.get_object()
+        derniere_position = None
+        if presence.derniere_latitude_connue is not None and presence.derniere_longitude_connue is not None:
+            derniere_position = {
+                'latitude': float(presence.derniere_latitude_connue),
+                'longitude': float(presence.derniere_longitude_connue),
+            }
+        return Response({
+            'agent': f"{presence.agent.nom} {presence.agent.prenom or ''}".strip(),
+            'sortie_detectee': presence.sortie_detectee,
+            'heure_sortie': presence.heure_sortie,
+            'temps_absence_minutes': presence.temps_absence_minutes,
+            'derniere_position': derniere_position,
+            'lien_carte': (
+                f"https://www.google.com/maps?q={presence.derniere_latitude_connue},{presence.derniere_longitude_connue}"
+                if derniere_position else None
+            ),
+            'trace': presence.trace_absence or [],
+        })
+
+
+
+
+class IsEdiligenceAdmin(permissions.BasePermission):
+    """Autorise uniquement les comptes e-diligence de role ADMIN. Utilise pour
+    les ecrans/API sensibles (ex: Droits & Permissions) qui pilotent
+    desormais reellement le controle d'acces (et non plus un simple affichage)."""
+
+    def has_permission(self, request, view):
+        user = getattr(request, 'user', None)
+        if not user or not user.is_authenticated:
+            return False
+        profile = getattr(user, 'profile', None)
+        return bool(profile and profile.role == 'ADMIN')
+
+
+class RolePermissionViewSet(viewsets.ModelViewSet):
+    queryset = RolePermission.objects.all()
+    serializer_class = RolePermissionSerializer
+    permission_classes = [IsEdiligenceAdmin]
+    authentication_classes = [JWTAuthentication]
+
+
+class UserDiligenceCommentViewSet(viewsets.ModelViewSet):
+    serializer_class = UserDiligenceCommentSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    def get_queryset(self):
+        queryset = UserDiligenceComment.objects.all()
+        diligence_id = self.request.query_params.get('diligence', None)
+        user_id = self.request.query_params.get('user', None)
+        
+        if diligence_id is not None:
+            queryset = queryset.filter(diligence=diligence_id)
+        if user_id is not None:
+            queryset = queryset.filter(user=user_id)
+            
+        return queryset
+
+    def perform_create(self, serializer):
+        diligence = serializer.validated_data['diligence']
+        user = serializer.validated_data.get('user', self.request.user)
+        comment = serializer.validated_data['comment']
+        obj, created = UserDiligenceComment.objects.update_or_create(
+            diligence=diligence,
+            user=user,
+            defaults={'comment': comment}
+        )
+        serializer.instance = obj
+
+
+class UserDiligenceInstructionViewSet(viewsets.ModelViewSet):
+    serializer_class = UserDiligenceInstructionSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    def get_queryset(self):
+        queryset = UserDiligenceInstruction.objects.all()
+        diligence_id = self.request.query_params.get('diligence', None)
+        user_id = self.request.query_params.get('user', None)
+        
+        if diligence_id is not None:
+            queryset = queryset.filter(diligence=diligence_id)
+        if user_id is not None:
+            queryset = queryset.filter(user=user_id)
+            
+        return queryset
+
+    def perform_create(self, serializer):
+        # Mettre à jour ou créer l'instruction
+        diligence = serializer.validated_data['diligence']
+        user = serializer.validated_data['user']
+        instruction = serializer.validated_data['instruction']
+        
+        obj, created = UserDiligenceInstruction.objects.update_or_create(
+            diligence=diligence,
+            user=user,
+            defaults={'instruction': instruction}
+        )
+        return obj
+
+
+class DemandeCongeViewSet(viewsets.ModelViewSet):
+    serializer_class = DemandeCongeSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+    
+    def envoyer_notification(self, utilisateur, type_notification, titre, message, lien=''):
+        """
+        Envoie une notification à un utilisateur via le système de notification
+        
+        Args:
+            utilisateur: L'utilisateur destinataire
+            type_notification: Type de notification (ex: 'conges_validation', 'conges_rejet')
+            titre: Titre de la notification
+            message: Contenu détaillé de la notification
+            lien: Lien optionnel vers la ressource concernée
+        """
+        try:
+            from .models import DiligenceNotification
+            
+            # Création de la notification dans la base de données
+            notification = DiligenceNotification.objects.create(
+                user=utilisateur,
+                type_notification=type_notification,
+                message=message,
+                lien=lien
+            )
+            
+            # Ici, vous pourriez ajouter l'envoi de notification en temps réel
+            # via des WebSockets ou un autre système de messagerie
+            
+            return True
+            
+        except Exception as e:
+            print(f"Erreur lors de l'envoi de la notification à {utilisateur.username}: {str(e)}")
+            return False
+    
+    def get_queryset(self):
+        user = self.request.user
+        profile = getattr(user, 'profile', None)
+        
+        if not profile:
+            return DemandeConge.objects.none()
+
+        site_id = get_site_id_for_request(self.request)
+
+        # ADMIN peut voir toutes les demandes (filtrées par site si sélectionné)
+        if profile.role == 'ADMIN':
+            qs = DemandeConge.objects.all().order_by('-date_creation')
+            if site_id:
+                qs = qs.filter(demandeur__profile__site_id=site_id)
+            return qs
+        
+        # DIRECTEUR peut voir les demandes de toute sa direction
+        elif profile.role == 'DIRECTEUR':
+            if profile.service and profile.service.direction:
+                direction_users = User.objects.filter(
+                    profile__service__direction=profile.service.direction
+                )
+                return DemandeConge.objects.filter(
+                    models.Q(demandeur=user) | 
+                    models.Q(demandeur__in=direction_users) |
+                    models.Q(superieur_hierarchique=user)
+                ).order_by('-date_creation')
+        
+        # SUPERIEUR peut voir les demandes de son service uniquement
+        elif profile.role == 'SUPERIEUR':
+            if profile.service:
+                service_users = User.objects.filter(profile__service=profile.service)
+                return DemandeConge.objects.filter(
+                    models.Q(demandeur=user) | 
+                    models.Q(demandeur__in=service_users) |
+                    models.Q(superieur_hierarchique=user)
+                ).order_by('-date_creation')
+        
+        # SECRETAIRE peut voir les demandes de son service + ses propres demandes
+        elif profile.role == 'SECRETAIRE':
+            if profile.service:
+                service_users = User.objects.filter(profile__service=profile.service)
+                return DemandeConge.objects.filter(
+                    models.Q(demandeur=user) | 
+                    models.Q(demandeur__in=service_users) |
+                    models.Q(superieur_hierarchique=user)
+                ).order_by('-date_creation')
+        
+        # AGENT ne peut voir que ses propres demandes
+        return DemandeConge.objects.filter(demandeur=user).order_by('-date_creation')
+    
+    def perform_create(self, serializer):
+        # Déterminer le supérieur hiérarchique automatiquement
+        user = self.request.user
+        profile = getattr(user, 'profile', None)
+        superieur = None
+        
+        if profile and profile.service:
+            # Chercher un supérieur dans le même service
+            superieur_profiles = UserProfile.objects.filter(
+                service=profile.service,
+                role__in=['SUPERIEUR', 'DIRECTEUR', 'SECRETAIRE']
+            ).exclude(user=user).first()
+            
+            if superieur_profiles:
+                superieur = superieur_profiles.user
+        
+        # Sauvegarder la demande
+        demande = serializer.save(demandeur=user, superieur_hierarchique=superieur)
+        
+        # Créer une notification pour le supérieur hiérarchique
+        if superieur:
+            try:
+                from .models import DiligenceNotification
+                from .notifications import send_push_to_user
+                DiligenceNotification.objects.create(
+                    user=superieur,
+                    diligence=None,
+                    type_notification='nouvelle_diligence',
+                    message=f'{user.first_name} {user.last_name} a soumis une demande de congé {demande.get_type_conge_display()} du {demande.date_debut} au {demande.date_fin} nécessitant votre validation'
+                )
+                send_push_to_user(
+                    user=superieur,
+                    title='Demande de congé à valider 📋',
+                    body=f'{user.get_full_name() or user.username} a soumis une demande de congé du {demande.date_debut} au {demande.date_fin}.',
+                    data={'type': 'conge_soumis', 'conge_id': str(demande.id)},
+                )
+            except Exception as e:
+                print(f"Erreur notification supérieur congé: {e}")
+        
+        # Lier automatiquement les agents de la même direction et service
+        if profile and profile.service:
+            # Récupérer tous les agents du même service
+            agents_meme_service = User.objects.filter(
+                profile__service=profile.service
+            ).exclude(id=user.id)
+            
+            # Si pas assez d'agents dans le service, inclure ceux de la même direction
+            if agents_meme_service.count() < 3 and profile.service.direction:
+                agents_meme_direction = User.objects.filter(
+                    profile__service__direction=profile.service.direction
+                ).exclude(id=user.id)
+                
+                # Combiner les agents du service et de la direction
+                agents_concernes = agents_meme_service.union(agents_meme_direction)
+            else:
+                agents_concernes = agents_meme_service
+            
+            # Ajouter les agents concernés
+            demande.agents_concernes.set(agents_concernes)
+            
+            # Créer des notifications pour les agents concernés
+            try:
+                from .models import DiligenceNotification
+                for agent in agents_concernes:
+                    DiligenceNotification.objects.create(
+                        user=agent,
+                        diligence=None,
+                        type_notification='nouvelle_diligence',
+                        message=f'{user.first_name} {user.last_name} a demandé un congé {demande.get_type_conge_display()} du {demande.date_debut} au {demande.date_fin}'
+                    )
+            except Exception as e:
+                print(f"Erreur notification agents concernés congé: {e}")
+    
+    @action(detail=True, methods=['post'])
+    def approuver(self, request, pk=None):
+        demande = self.get_object()
+        
+        # Vérifier que l'utilisateur peut approuver cette demande
+        if demande.superieur_hierarchique != request.user:
+            profile = getattr(request.user, 'profile', None)
+            if not profile or profile.role not in ['ADMIN', 'SUPERIEUR', 'DIRECTEUR']:
+                return Response({'error': 'Non autorisé'}, status=403)
+        
+        demande.statut = 'approuve'
+        demande.date_validation = timezone.now()
+        demande.commentaire_validation = request.data.get('commentaire', '')
+        demande.save()
+        
+        # Créer une notification pour le demandeur
+        try:
+            from .notifications import send_push_to_user
+            notification = Notification(
+                user=demande.demandeur,
+                type_notif='demande_approuvee',
+                contenu=f'Votre demande de congé du {demande.date_debut} au {demande.date_fin} a été approuvée',
+                lien=f'/conges/{demande.id}'
+            )
+            notification.save()
+
+            self.envoyer_notification(
+                utilisateur=demande.demandeur,
+                type_notification='conges_validation',
+                titre='Demande de congé approuvée',
+                message=f'Votre demande de congé du {demande.date_debut} au {demande.date_fin} a été approuvée par {request.user.get_full_name() or request.user.username}.',
+                lien=f'/conges/{demande.id}'
+            )
+            send_push_to_user(
+                user=demande.demandeur,
+                title='Congé approuvé ✅',
+                body=f'Votre congé du {demande.date_debut} au {demande.date_fin} a été approuvé.',
+                data={'type': 'conge_decision', 'conge_id': str(demande.id), 'statut': 'approuve'},
+            )
+        except Exception as e:
+            print(f"Erreur notification congé approuvé: {e}")
+
+        return Response({'message': 'Demande approuvée'})
+
+    @action(detail=True, methods=['post'])
+    def rejeter(self, request, pk=None):
+        demande = self.get_object()
+
+        # Vérifier que l'utilisateur peut rejeter cette demande
+        if demande.superieur_hierarchique != request.user:
+            profile = getattr(request.user, 'profile', None)
+            if not profile or profile.role not in ['ADMIN', 'SUPERIEUR', 'DIRECTEUR']:
+                return Response({'error': 'Non autorisé'}, status=403)
+
+        demande.statut = 'rejete'
+        demande.date_validation = timezone.now()
+        demande.commentaire_validation = request.data.get('commentaire', '')
+        demande.save()
+
+        # Créer une notification pour le demandeur
+        try:
+            from .notifications import send_push_to_user
+            from .models import Notification
+            notification = Notification(
+                user=demande.demandeur,
+                type_notif='demande_rejetee',
+                contenu=f'Votre demande de congé {demande.type_conge} du {demande.date_debut} au {demande.date_fin} a été rejetée',
+                lien=f'/conges/{demande.id}'
+            )
+            notification.save()
+
+            self.envoyer_notification(
+                utilisateur=demande.demandeur,
+                type_notification='conges_rejet',
+                titre='Demande de congé rejetée',
+                message=f'Votre demande de congé du {demande.date_debut} au {demande.date_fin} a été rejetée par {request.user.get_full_name() or request.user.username}. Motif: {request.data.get("commentaire", "Aucun motif fourni")}',
+                lien=f'/conges/{demande.id}'
+            )
+            send_push_to_user(
+                user=demande.demandeur,
+                title='Congé rejeté ❌',
+                body=f'Votre congé du {demande.date_debut} au {demande.date_fin} a été rejeté. Motif : {request.data.get("commentaire", "—")}',
+                data={'type': 'conge_decision', 'conge_id': str(demande.id), 'statut': 'rejete'},
+            )
+        except Exception as e:
+            print(f"Erreur notification congé rejeté: {e}")
+
+        return Response({'message': 'Demande rejetée'})
+    
+    @action(detail=True, methods=['get'], permission_classes=[AllowAny])
+    def telecharger_pdf(self, request, pk=None):
+        """Télécharge la demande de congé en PDF — supporte ?token= pour téléchargement navigateur."""
+        user = request.user
+        if not user.is_authenticated:
+            token_param = request.query_params.get('token')
+            if token_param:
+                try:
+                    from rest_framework_simplejwt.tokens import AccessToken
+                    access_token = AccessToken(token_param)
+                    user = User.objects.get(id=access_token['user_id'])
+                except Exception:
+                    return Response({'detail': 'Token invalide.'}, status=status.HTTP_401_UNAUTHORIZED)
+            else:
+                return Response({'detail': 'Non authentifié.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        demande = get_object_or_404(DemandeConge, pk=pk)
+        if not (user.is_staff or user == demande.demandeur or
+                (hasattr(user, 'profile') and user.profile.role in ['ADMIN', 'DIRECTEUR', 'CHEF_SERVICE', 'SOUS_DIRECTEUR', 'SUPERIEUR'])):
+            return Response({'detail': 'Accès refusé.'}, status=status.HTTP_403_FORBIDDEN)
+
+        buffer = generate_conge_pdf(demande)
+        filename = f"demande_conge_{demande.demandeur.username}_{demande.date_creation.strftime('%Y%m%d')}.pdf"
+        return create_pdf_response(buffer, filename)
+
+
+class DemandeAbsenceViewSet(viewsets.ModelViewSet):
+    serializer_class = DemandeAbsenceSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+    
+    def envoyer_notification(self, utilisateur, type_notification, titre, message, lien=''):
+        """
+        Envoie une notification à un utilisateur via le système de notification
+        
+        Args:
+            utilisateur: L'utilisateur destinataire
+            type_notification: Type de notification (ex: 'conges_validation', 'absences_rejet')
+            titre: Titre de la notification
+            message: Contenu détaillé de la notification
+            lien: Lien optionnel vers la ressource concernée
+        """
+        try:
+            from .models import DiligenceNotification
+            
+            # Création de la notification dans la base de données
+            notification = DiligenceNotification.objects.create(
+                user=utilisateur,
+                type_notification=type_notification,
+                message=message,
+                lien=lien
+            )
+            
+            # Ici, vous pourriez ajouter l'envoi de notification en temps réel
+            # via des WebSockets ou un autre système de messagerie
+            
+            return True
+            
+        except Exception as e:
+            print(f"Erreur lors de l'envoi de la notification à {utilisateur.username}: {str(e)}")
+            return False
+    
+    def get_queryset(self):
+        user = self.request.user
+        profile = getattr(user, 'profile', None)
+        
+        if not profile:
+            return DemandeAbsence.objects.none()
+
+        site_id = get_site_id_for_request(self.request)
+
+        # ADMIN peut voir toutes les demandes (filtrées par site si sélectionné)
+        if profile.role == 'ADMIN':
+            qs = DemandeAbsence.objects.all().order_by('-created_at')
+            if site_id:
+                qs = qs.filter(demandeur__profile__site_id=site_id)
+            return qs
+        
+        # DIRECTEUR peut voir les demandes de toute sa direction
+        elif profile.role == 'DIRECTEUR':
+            if profile.service and profile.service.direction:
+                direction_users = User.objects.filter(
+                    profile__service__direction=profile.service.direction
+                )
+                return DemandeAbsence.objects.filter(
+                    models.Q(demandeur=user) | 
+                    models.Q(demandeur__in=direction_users) |
+                    models.Q(superieur_hierarchique=user)
+                ).order_by('-created_at')
+        
+        # SUPERIEUR peut voir les demandes de son service uniquement
+        elif profile.role == 'SUPERIEUR':
+            if profile.service:
+                service_users = User.objects.filter(profile__service=profile.service)
+                return DemandeAbsence.objects.filter(
+                    models.Q(demandeur=user) | 
+                    models.Q(demandeur__in=service_users) |
+                    models.Q(superieur_hierarchique=user)
+                ).order_by('-created_at')
+        
+        # SECRETAIRE peut voir les demandes de son service + ses propres demandes
+        elif profile.role == 'SECRETAIRE':
+            if profile.service:
+                service_users = User.objects.filter(profile__service=profile.service)
+                return DemandeAbsence.objects.filter(
+                    models.Q(demandeur=user) | 
+                    models.Q(demandeur__in=service_users) |
+                    models.Q(superieur_hierarchique=user)
+                ).order_by('-created_at')
+        
+        # AGENT ne peut voir que ses propres demandes
+        return DemandeAbsence.objects.filter(demandeur=user).order_by('-created_at')
+    
+    def perform_create(self, serializer):
+        # Déterminer le supérieur hiérarchique automatiquement
+        user = self.request.user
+        profile = getattr(user, 'profile', None)
+        superieur = None
+        
+        if profile and profile.service:
+            # Chercher un supérieur dans le même service
+            superieur_profiles = UserProfile.objects.filter(
+                service=profile.service,
+                role__in=['SUPERIEUR', 'DIRECTEUR', 'SECRETAIRE']
+            ).exclude(user=user).first()
+            
+            if superieur_profiles:
+                superieur = superieur_profiles.user
+        
+        # Sauvegarder la demande
+        demande = serializer.save(demandeur=user, superieur_hierarchique=superieur)
+        
+        # Créer une notification pour le supérieur hiérarchique
+        if superieur:
+            try:
+                from .models import DiligenceNotification
+                from .notifications import send_push_to_user
+                DiligenceNotification.objects.create(
+                    user=superieur,
+                    diligence=None,
+                    type_notification='nouvelle_diligence',
+                    message=f'{user.first_name} {user.last_name} a soumis une demande d\'absence {demande.get_type_absence_display()} du {demande.date_debut} au {demande.date_fin} nécessitant votre validation'
+                )
+                send_push_to_user(
+                    user=superieur,
+                    title='Demande d\'absence à valider 📋',
+                    body=f'{user.get_full_name() or user.username} a soumis une demande d\'absence du {demande.date_debut.strftime("%d/%m/%Y")}.',
+                    data={'type': 'absence_soumise', 'absence_id': str(demande.id)},
+                )
+            except Exception as e:
+                print(f"Erreur notification supérieur absence: {e}")
+        
+        # Lier automatiquement les agents de la même direction et service
+        if profile and profile.service:
+            # Récupérer tous les agents du même service
+            agents_meme_service = User.objects.filter(
+                profile__service=profile.service
+            ).exclude(id=user.id)
+            
+            # Si pas assez d'agents dans le service, inclure ceux de la même direction
+            if agents_meme_service.count() < 3 and profile.service.direction:
+                agents_meme_direction = User.objects.filter(
+                    profile__service__direction=profile.service.direction
+                ).exclude(id=user.id)
+                
+                # Combiner les agents du service et de la direction
+                agents_concernes = agents_meme_service.union(agents_meme_direction)
+            else:
+                agents_concernes = agents_meme_service
+            
+            # Ajouter les agents concernés
+            demande.agents_concernes.set(agents_concernes)
+            
+            # Créer des notifications pour les agents concernés
+            try:
+                from .models import DiligenceNotification
+                for agent in agents_concernes:
+                    DiligenceNotification.objects.create(
+                        user=agent,
+                        diligence=None,
+                        type_notification='nouvelle_diligence',
+                        message=f'{user.first_name} {user.last_name} a demandé une absence {demande.get_type_absence_display()} du {demande.date_debut} au {demande.date_fin}'
+                    )
+            except Exception as e:
+                print(f"Erreur notification agents concernés absence: {e}")
+    
+    @action(detail=True, methods=['post'])
+    def approuver(self, request, pk=None):
+        demande = self.get_object()
+        
+        # Vérifier que l'utilisateur peut approuver cette demande
+        if demande.superieur_hierarchique != request.user:
+            profile = getattr(request.user, 'profile', None)
+            if not profile or profile.role not in ['ADMIN', 'SUPERIEUR', 'DIRECTEUR']:
+                return Response({'error': 'Non autorisé'}, status=403)
+        
+        demande.statut = 'approuve'
+        demande.date_validation = timezone.now()
+        demande.commentaire_validation = request.data.get('commentaire', '')
+        demande.save()
+        
+        # Créer une notification pour le demandeur
+        try:
+            from .notifications import send_push_to_user
+            from .models import Notification
+            notification = Notification(
+                user=demande.demandeur,
+                type_notif='demande_approuvee',
+                contenu=f'Votre demande d\'absence {demande.type_absence} du {demande.date_debut.strftime("%d/%m/%Y %H:%M")} a été approuvée',
+                message=f'Votre demande d\'absence {demande.type_absence} du {demande.date_debut.strftime("%d/%m/%Y %H:%M")} a été approuvée par {request.user.get_full_name() or request.user.username}.',
+                lien=f'/absences/{demande.id}'
+            )
+            notification.save()
+            if hasattr(self, 'envoyer_notification'):
+                self.envoyer_notification(
+                    utilisateur=demande.demandeur,
+                    type_notification='absences_validation',
+                    titre='Demande d\'absence approuvée',
+                    message=f'Votre demande d\'absence du {demande.date_debut.strftime("%d/%m/%Y %H:%M")} a été approuvée par {request.user.get_full_name() or request.user.username}.',
+                    lien=f'/absences/{demande.id}'
+                )
+            send_push_to_user(
+                user=demande.demandeur,
+                title='Absence approuvée ✅',
+                body=f'Votre demande d\'absence du {demande.date_debut.strftime("%d/%m/%Y")} a été approuvée.',
+                data={'type': 'absence_decision', 'absence_id': str(demande.id), 'statut': 'approuve'},
+            )
+        except Exception as e:
+            print(f"Erreur lors de la création des notifications: {str(e)}")
+
+        return Response({'message': 'Demande approuvée'})
+
+    @action(detail=True, methods=['post'])
+    def rejeter(self, request, pk=None):
+        demande = self.get_object()
+
+        # Vérifier que l'utilisateur peut rejeter cette demande
+        if demande.superieur_hierarchique != request.user:
+            profile = getattr(request.user, 'profile', None)
+            if not profile or profile.role not in ['ADMIN', 'SUPERIEUR', 'DIRECTEUR']:
+                return Response({'error': 'Non autorisé'}, status=403)
+
+        demande.statut = 'rejete'
+        demande.date_validation = timezone.now()
+        demande.commentaire_validation = request.data.get('commentaire', '')
+        demande.save()
+
+        # Créer une notification pour le demandeur
+        try:
+            from .notifications import send_push_to_user
+            from .models import Notification
+            notification = Notification(
+                user=demande.demandeur,
+                type_notif='demande_rejetee',
+                contenu=f'Votre demande d\'absence {demande.type_absence} du {demande.date_debut.strftime("%d/%m/%Y %H:%M")} a été rejetée',
+                lien=f'/absences/{demande.id}'
+            )
+            notification.save()
+
+            self.envoyer_notification(
+                utilisateur=demande.demandeur,
+                type_notification='absences_rejet',
+                titre='Demande d\'absence rejetée',
+                message=f'Votre demande d\'absence du {demande.date_debut.strftime("%d/%m/%Y %H:%M")} a été rejetée par {request.user.get_full_name() or request.user.username}. Motif: {request.data.get("commentaire", "Aucun motif fourni")}',
+                lien=f'/absences/{demande.id}'
+            )
+            send_push_to_user(
+                user=demande.demandeur,
+                title='Absence rejetée ❌',
+                body=f'Votre demande d\'absence du {demande.date_debut.strftime("%d/%m/%Y")} a été rejetée. Motif : {request.data.get("commentaire", "—")}',
+                data={'type': 'absence_decision', 'absence_id': str(demande.id), 'statut': 'rejete'},
+            )
+        except Exception as e:
+            print(f"Erreur notification absence rejetée: {e}")
+
+        return Response({'message': 'Demande rejetée'})
+    
+    @action(detail=True, methods=['get'], permission_classes=[AllowAny])
+    def telecharger_pdf(self, request, pk=None):
+        """Télécharge la demande d'absence en PDF — supporte ?token= pour téléchargement navigateur."""
+        user = request.user
+        if not user.is_authenticated:
+            token_param = request.query_params.get('token')
+            if token_param:
+                try:
+                    from rest_framework_simplejwt.tokens import AccessToken
+                    access_token = AccessToken(token_param)
+                    user = User.objects.get(id=access_token['user_id'])
+                except Exception:
+                    return Response({'detail': 'Token invalide.'}, status=status.HTTP_401_UNAUTHORIZED)
+            else:
+                return Response({'detail': 'Non authentifié.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        demande = get_object_or_404(DemandeAbsence, pk=pk)
+        if not (user.is_staff or user == demande.demandeur or
+                (hasattr(user, 'profile') and user.profile.role in ['ADMIN', 'DIRECTEUR', 'CHEF_SERVICE', 'SOUS_DIRECTEUR', 'SUPERIEUR'])):
+            return Response({'detail': 'Accès refusé.'}, status=status.HTTP_403_FORBIDDEN)
+
+        buffer = generate_absence_pdf(demande)
+        filename = f"demande_absence_{demande.demandeur.username}_{demande.created_at.strftime('%Y%m%d')}.pdf"
+        return create_pdf_response(buffer, filename)
+
+
+class CourrierImputationViewSet(viewsets.ModelViewSet):
+    """ViewSet pour gérer les imputations des courriers (ordinaires et confidentiels)"""
+    serializer_class = CourrierImputationSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    def get_queryset(self):
+        user = self.request.user
+        queryset = CourrierImputation.objects.select_related('courrier', 'user', 'granted_by')
+        
+        # Seuls les ADMIN et DIRECTEUR peuvent voir toutes les imputations
+        if hasattr(user, 'profile') and user.profile.role in ['ADMIN', 'DIRECTEUR']:
+            queryset = queryset.all()
+        else:
+            # Les autres utilisateurs ne voient que leurs propres imputations
+            queryset = queryset.filter(user=user)
+        
+        # Filtrage par courrier
+        courrier_id = self.request.query_params.get('courrier')
+        if courrier_id:
+            queryset = queryset.filter(courrier_id=courrier_id)
+        
+        # Filtrage par type de courrier (ordinaire/confidentiel)
+        type_courrier = self.request.query_params.get('type_courrier')
+        if type_courrier:
+            queryset = queryset.filter(courrier__type_courrier=type_courrier)
+        
+        # Filtrage par sens (arrivée/départ)
+        sens = self.request.query_params.get('sens')
+        if sens:
+            queryset = queryset.filter(courrier__sens=sens)
+        
+        # Filtrage par utilisateur imputé
+        user_id = self.request.query_params.get('user')
+        if user_id:
+            queryset = queryset.filter(user_id=user_id)
+        
+        # Filtrage par type d'accès (view/edit)
+        access_type = self.request.query_params.get('access_type')
+        if access_type:
+            queryset = queryset.filter(access_type=access_type)
+        
+        return queryset
+
+    def create(self, request, *args, **kwargs):
+        """Créer une imputation - seuls ADMIN et DIRECTEUR peuvent le faire"""
+        user = request.user
+        
+        # Vérifier les permissions
+        if not (hasattr(user, 'profile') and user.profile.role in ['ADMIN', 'DIRECTEUR']):
+            return Response(
+                {'error': 'Seuls les administrateurs et directeurs peuvent créer des imputations'}, 
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Ajouter l'utilisateur qui accorde l'imputation
+        data = request.data.copy()
+        data['granted_by'] = user.id
+        
+        serializer = self.get_serializer(data=data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def destroy(self, request, *args, **kwargs):
+        """Supprimer une imputation - seuls ADMIN et DIRECTEUR peuvent le faire"""
+        user = request.user
+        
+        # Vérifier les permissions
+        if not (hasattr(user, 'profile') and user.profile.role in ['ADMIN', 'DIRECTEUR']):
+            return Response(
+                {'error': 'Seuls les administrateurs et directeurs peuvent supprimer des imputations'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        return super().destroy(request, *args, **kwargs)
+
+
+class CourrierInstructionViewSet(viewsets.ModelViewSet):
+    """Bordereau d'instructions pour un courrier (formulaire papier numérisé)"""
+    serializer_class = CourrierInstructionSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    def get_queryset(self):
+        qs = CourrierInstruction.objects.select_related('courrier', 'creee_par')
+        courrier_id = self.request.query_params.get('courrier')
+        if courrier_id:
+            qs = qs.filter(courrier_id=courrier_id)
+        return qs
+
+    @action(detail=False, methods=['get'], url_path='preview_reference')
+    def preview_reference(self, request):
+        """Pré-visualise la référence qui sera générée sans créer le courrier."""
+        from datetime import date
+        sens = request.query_params.get('sens', 'arrivee')
+        date_str = request.query_params.get('date', str(date.today()))
+        try:
+            d = date.fromisoformat(date_str)
+        except ValueError:
+            d = date.today()
+        ref = Courrier.generer_reference(sens, d)
+        return Response({'reference': ref})
+
+
+class CourrierAnnexeViewSet(viewsets.ModelViewSet):
+    """Annexes (fichiers joints supplémentaires) d'un courrier"""
+    serializer_class = CourrierAnnexeSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+    parser_classes = (MultiPartParser, FormParser, JSONParser)
+
+    def get_queryset(self):
+        qs = CourrierAnnexe.objects.select_related('courrier', 'uploaded_by')
+        courrier_id = self.request.query_params.get('courrier')
+        if courrier_id:
+            qs = qs.filter(courrier_id=courrier_id)
+        return qs
+
+
+class PresenceSummaryView(APIView):
+    """GET /api/presences/summary/ — Stats de présence agrégées du jour en une seule requête DB."""
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    def get(self, request):
+        today = date.today()
+        site_id = get_site_id_for_request(request)
+
+        qs = Presence.objects.filter(date_presence=today)
+        if site_id:
+            qs = qs.filter(agent__user__profile__site_id=site_id)
+        presents = qs.filter(statut__in=['présent', 'en mission']).count()
+
+        users_qs = User.objects.filter(is_active=True)
+        if site_id:
+            users_qs = users_qs.filter(profile__site_id=site_id)
+        total_agents = users_qs.count()
+
+        if site_id:
+            bureaux_count = Bureau.objects.filter(site_id=site_id).count()
+        else:
+            bureaux_count = Bureau.objects.count()
+
+        taux = round((presents / total_agents * 100) if total_agents > 0 else 0, 1)
+
+        return Response({
+            'presentsAujourdhui': presents,
+            'totalAgents': total_agents,
+            'bureauxActifs': bureaux_count,
+            'tauxPresence': taux,
+        })

@@ -1,0 +1,2445 @@
+from django.db import models
+from django.contrib.auth.models import User
+
+from django.utils import timezone
+
+class ImputationFile(models.Model):
+    MODE_CHOICES = [
+        ('lecture_seule', 'Lecture seule'),
+        ('intervenant', 'Intervenant'),
+    ]
+    diligence = models.ForeignKey('Diligence', on_delete=models.CASCADE, related_name='imputation_files')
+    agent = models.ForeignKey(User, on_delete=models.CASCADE, related_name='imputation_files')
+    file = models.FileField(upload_to='imputation_files/', null=True, blank=True)
+    sfdt_content = models.TextField(null=True, blank=True, help_text="Contenu du document Word au format Syncfusion SFDT")
+    mode = models.CharField(max_length=20, choices=MODE_CHOICES, default='lecture_seule')
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='imputation_files_created')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.diligence} - {self.agent} ({self.mode})"
+
+class Direction(models.Model):
+    """Une Direction est une entité qui regroupe plusieurs sous-directions.
+    Par exemple: Direction des Ressources Humaines, Direction Financière, etc."""
+    TYPE_CHOICES = [
+        ('cabinet', 'Cabinet'),
+        ('direction_generale', 'Direction Générale'),
+        ('direction', 'Direction'),
+    ]
+    nom = models.CharField(max_length=255)
+    description = models.TextField(blank=True, null=True)
+    type_direction = models.CharField(max_length=30, choices=TYPE_CHOICES, default='direction', verbose_name='Type')
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        verbose_name = 'Direction'
+        verbose_name_plural = 'Directions'
+        ordering = ['type_direction', 'nom']
+
+    def __str__(self):
+        labels = {'cabinet': 'Cabinet', 'direction_generale': 'Dir. Gén.', 'direction': 'Direction'}
+        prefix = labels.get(self.type_direction, '')
+        return f"[{prefix}] {self.nom}" if prefix and self.type_direction != 'direction' else self.nom
+    
+    @property
+    def nombre_sous_directions(self):
+        """Retourne le nombre de sous-directions dans cette direction"""
+        try:
+            return self.sous_directions.count()
+        except:
+            return 0
+    
+    @property
+    def nombre_services(self):
+        """Retourne le nombre total de services dans cette direction (via les sous-directions)"""
+        try:
+            return Service.objects.filter(sous_direction__direction=self).count()
+        except:
+            # Fallback pour avant la migration vers sous-directions
+            return Service.objects.filter(direction=self).count()
+
+    def save(self, *args, **kwargs):
+        if not self.created_at:
+            self.created_at = timezone.now()
+        self.updated_at = timezone.now()
+        super().save(*args, **kwargs)
+
+
+class SousDirection(models.Model):
+    """Une Sous-Direction appartient à une Direction et regroupe plusieurs services.
+    Par exemple: Sous-Direction Paie (Direction RH), Sous-Direction Comptabilité (Direction Financière)"""
+    nom = models.CharField(max_length=255)
+    description = models.TextField(blank=True, null=True)
+    direction = models.ForeignKey(
+        Direction,
+        on_delete=models.CASCADE,
+        related_name='sous_directions',
+        help_text='La direction à laquelle cette sous-direction appartient'
+    )
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        verbose_name = 'Sous-Direction'
+        verbose_name_plural = 'Sous-Directions'
+        ordering = ['direction__nom', 'nom']
+        unique_together = ['nom', 'direction']  # Un nom de sous-direction doit être unique dans une direction
+
+    def __str__(self):
+        return f"{self.nom} ({self.direction.nom})"
+    
+    @property
+    def nombre_services(self):
+        """Retourne le nombre de services dans cette sous-direction"""
+        return self.services.count()
+
+    def save(self, *args, **kwargs):
+        if not self.created_at:
+            self.created_at = timezone.now()
+        self.updated_at = timezone.now()
+        super().save(*args, **kwargs)
+
+class Service(models.Model):
+    """Un Service est une unité qui appartient à une Sous-Direction.
+    Par exemple: Service Paie (Sous-Direction RH), Service Comptabilité (Sous-Direction Financière)"""
+    nom = models.CharField(max_length=255)
+    description = models.TextField(blank=True, null=True)
+    sous_direction = models.ForeignKey(
+        SousDirection,
+        on_delete=models.CASCADE,  # Si une sous-direction est supprimée, ses services le sont aussi
+        related_name='services',
+        help_text='La sous-direction à laquelle ce service appartient',
+        null=True,  # Temporairement nullable pour la migration
+        blank=True
+    )
+    # Garder temporairement direction pour la migration
+    direction = models.ForeignKey(
+        Direction,
+        on_delete=models.CASCADE,
+        related_name='services_legacy',
+        help_text='DEPRECATED: Utilisez sous_direction à la place',
+        null=True,
+        blank=True
+    )
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(default=timezone.now)
+    
+    class Meta:
+        verbose_name = 'Service'
+        verbose_name_plural = 'Services'
+        ordering = ['sous_direction__direction__nom', 'sous_direction__nom', 'nom']  # Trié par direction > sous-direction > service
+        unique_together = ['nom', 'sous_direction']  # Un nom de service doit être unique dans une sous-direction
+    
+    def __str__(self):
+        if self.sous_direction:
+            return f"{self.nom} ({self.sous_direction.nom} - {self.sous_direction.direction.nom})"
+        elif self.direction:
+            return f"{self.nom} ({self.direction.nom})"
+        return self.nom
+    
+    @property
+    def get_direction(self):
+        """Retourne la direction via la sous-direction ou directement"""
+        if self.sous_direction:
+            return self.sous_direction.direction
+        return self.direction
+
+    def save(self, *args, **kwargs):
+        if not self.created_at:
+            self.created_at = timezone.now()
+        self.updated_at = timezone.now()
+        super().save(*args, **kwargs)
+
+import secrets
+
+import secrets
+class UserProfile(models.Model):
+    empreinte_hash = models.CharField(max_length=255, blank=True, null=True, help_text="Hash de l'empreinte digitale de l'utilisateur")
+    ROLE_CHOICES = [
+        ('ADMIN', 'Admin'),
+        ('DIRECTEUR', 'Directeur'),  # Peut voir toutes les diligences de sa direction
+        ('SOUS_DIRECTEUR', 'Sous-Directeur'),  # Peut gérer les présences de sa direction
+        ('CHEF_SERVICE', 'Chef de Service'),  # Peut gérer les présences de son service
+        ('SUPERIEUR', 'Superieur'),  # Peut voir les diligences de son service
+        ('AGENT', 'Agent'),  # Peut voir et créer ses propres diligences
+        ('SECRETAIRE', 'Secretaire'),  # Peut voir et créer des diligences
+        ('PRESTATAIRE', 'Prestataire'),  # Peut voir les diligences qui lui sont assignées
+    ]
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='profile')
+    matricule = models.CharField(max_length=64, blank=True, null=True)
+    telephone = models.CharField(max_length=32, unique=True, blank=True, null=True)
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='AGENT')
+    cabinet = models.ForeignKey(
+        'Direction',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='cabinet_users',
+        limit_choices_to={'type_direction': 'cabinet'},
+    )
+    direction_generale = models.ForeignKey(
+        'Direction',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='direction_generale_users',
+        limit_choices_to={'type_direction': 'direction_generale'},
+    )
+    direction = models.ForeignKey(
+        'Direction',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='profile_users',
+        limit_choices_to={'type_direction': 'direction'},
+    )
+    sous_direction = models.ForeignKey(
+        'SousDirection',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='profile_users',
+    )
+    site = models.ForeignKey(
+        'Site',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='agents',
+    )
+    service = models.ForeignKey(
+        Service,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='users',
+        help_text='Le service auquel l\'utilisateur est rattaché'
+    )
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(default=timezone.now)
+
+    def save(self, *args, **kwargs):
+        if not self.created_at:
+            self.created_at = timezone.now()
+        self.updated_at = timezone.now()
+        super().save(*args, **kwargs)
+
+    class Meta:
+        verbose_name = 'Profil utilisateur'
+        verbose_name_plural = 'Profils utilisateurs'
+
+    def __str__(self):
+        return f"{self.user.username} - {self.role}"
+
+
+class Site(models.Model):
+    TYPE_SITE_CHOICES = [
+        ('siege', 'Siège'),
+        ('direction_regionale', 'Direction Régionale'),
+        ('agence', 'Agence'),
+        ('antenne', 'Antenne'),
+    ]
+    nom = models.CharField(max_length=255)
+    code = models.CharField(max_length=50, unique=True)
+    type_site = models.CharField(max_length=30, choices=TYPE_SITE_CHOICES, default='siege')
+    adresse = models.CharField(max_length=500, blank=True)
+    ville = models.CharField(max_length=100, blank=True)
+    commune = models.CharField(max_length=100, blank=True)
+    telephone = models.CharField(max_length=32, blank=True)
+    email = models.EmailField(blank=True)
+    responsable = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, related_name='sites_responsable'
+    )
+    logo = models.ImageField(upload_to='sites/logos/', null=True, blank=True)
+    fuseau_horaire = models.CharField(max_length=50, default='Africa/Abidjan')
+    est_actif = models.BooleanField(default=True)
+    org_unit_key = models.CharField(max_length=255, blank=True, null=True, help_text="Clé de l'unité organisationnelle liée (organigramme)")
+    org_unit_label = models.CharField(max_length=255, blank=True, null=True, help_text="Libellé de l'unité organisationnelle liée")
+    latitude = models.DecimalField(max_digits=10, decimal_places=8, null=True, blank=True)
+    longitude = models.DecimalField(max_digits=11, decimal_places=8, null=True, blank=True)
+    rayon_pointage = models.IntegerField(default=200, help_text='Rayon en mètres pour le pointage GPS')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Site'
+        verbose_name_plural = 'Sites'
+        ordering = ['nom']
+
+    def __str__(self):
+        return f"{self.nom} ({self.get_type_site_display()})"
+
+
+class Courrier(models.Model):
+    TYPE_CHOICES = [
+        ('ordinaire', 'Ordinaire'),
+        ('confidentiel', 'Confidentiel'),
+    ]
+    
+    SENS_CHOICES = [
+        ('arrivee', 'Arrivée'),
+        ('depart', 'Départ'),
+    ]
+    
+    CATEGORIE_CHOICES = [
+        ('Demande', 'Demande'),
+        ('Invitation', 'Invitation'),
+        ('Réclamation', 'Réclamation'),
+        ('Autre', 'Autre'),
+    ]
+
+    STATUT_CHOICES = [
+        ('nouveau', 'Nouveau'),
+        ('en_attente', 'En Attente'),
+        ('en_cours', 'En Cours'),
+        ('traite', 'Traité'),
+        ('termine', 'Terminé'),
+        ('archive', 'Archivé'),
+    ]
+
+    reference = models.CharField(max_length=255, unique=True)
+    expediteur = models.CharField(max_length=255)
+    destinataire = models.CharField(max_length=255, null=True, blank=True)
+    objet = models.TextField()
+    date_reception = models.DateField()
+    service = models.ForeignKey(Service, on_delete=models.SET_NULL, null=True, blank=True, related_name='courriers')
+    categorie = models.CharField(max_length=64, choices=CATEGORIE_CHOICES, default='Demande')
+    type_courrier = models.CharField(max_length=20, choices=TYPE_CHOICES, default='ordinaire')
+    sens = models.CharField(max_length=20, choices=SENS_CHOICES, default='arrivee')
+    statut = models.CharField(max_length=20, choices=STATUT_CHOICES, default='nouveau')
+    date_traitement = models.DateField(null=True, blank=True)
+    fichier_joint = models.FileField(upload_to='courriers/', null=True, blank=True)
+    rappel_traitement = models.BooleanField(default=False, help_text="Activer les rappels automatiques de traitement")
+    commentaires = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    # ── Traitement automatique (OCR / IA / miniature) ─────────────────────────
+
+    TRAITEMENT_STATUT_CHOICES = [
+        ('en_attente', 'En attente'),
+        ('en_cours',   'En cours'),
+        ('termine',    'Terminé'),
+        ('erreur',     'Erreur'),
+    ]
+    URGENCE_CHOICES = [
+        ('faible',   'Faible'),
+        ('normal',   'Normal'),
+        ('haute',    'Haute'),
+        ('critique', 'Critique'),
+    ]
+
+    thumbnail          = models.ImageField(upload_to='courriers/thumbnails/', null=True, blank=True)
+    ocr_text           = models.TextField(blank=True, null=True)
+    resume_ia          = models.TextField(blank=True, null=True)
+    mots_cles          = models.JSONField(default=list, blank=True)
+    theme              = models.CharField(max_length=100, blank=True, null=True)
+    service_propose    = models.CharField(max_length=200, blank=True, null=True)
+    niveau_urgence     = models.CharField(max_length=20, choices=URGENCE_CHOICES, default='normal', blank=True, null=True)
+    traitement_statut  = models.CharField(max_length=20, choices=TRAITEMENT_STATUT_CHOICES, default='en_attente', blank=True, null=True)
+
+    @staticmethod
+    def generer_reference(sens, date_reception, org_code='ORG'):
+        """
+        Génère une référence unique : {ORG}-CA{SEQ}-DD-MM-YYYY (arrivée)
+                                   ou {ORG}-CD{SEQ}-DD-MM-YYYY (départ)
+        La séquence est journalière et repart à 001 chaque jour.
+        """
+        from django.conf import settings
+        code = getattr(settings, 'COURRIER_ORG_CODE', org_code)
+        prefix = 'CA' if sens == 'arrivee' else 'CD'
+        date_str = date_reception.strftime('%d-%m-%Y') if hasattr(date_reception, 'strftime') else str(date_reception)
+        count = Courrier.objects.filter(
+            date_reception=date_reception,
+            sens=sens,
+        ).count() + 1
+        return f"{code}-{prefix}{str(count).zfill(3)}-{date_str}"
+
+    def save(self, *args, **kwargs):
+        if not self.reference:
+            from django.conf import settings
+            org_code = getattr(settings, 'COURRIER_ORG_CODE', 'ORG')
+            self.reference = Courrier.generer_reference(self.sens, self.date_reception, org_code)
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.reference} - {self.objet}"
+
+class CourrierAccess(models.Model):
+    """Modèle pour gérer l'accès aux courriers confidentiels"""
+    courrier = models.ForeignKey(Courrier, on_delete=models.CASCADE, related_name='access_permissions')
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='courrier_access')
+    granted_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='granted_courrier_access')
+    granted_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        unique_together = ('courrier', 'user')
+        verbose_name = 'Accès Courrier'
+        verbose_name_plural = 'Accès Courriers'
+    
+    def __str__(self):
+        return f"Accès {self.courrier.reference} pour {self.user.username}"
+
+class CourrierImputation(models.Model):
+    """Modèle pour l'imputation des courriers (ordinaires et confidentiels)"""
+    ACCESS_TYPE_CHOICES = [
+        ('view', 'Lecture'),
+        ('edit', 'Édition'),
+    ]
+    courrier = models.ForeignKey(Courrier, on_delete=models.CASCADE, related_name='imputation_access')
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='courrier_imputation_access')
+    access_type = models.CharField(max_length=10, choices=ACCESS_TYPE_CHOICES, default='view')
+    granted_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='granted_courrier_imputation')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ('courrier', 'user', 'access_type')
+        verbose_name = 'Imputation Courrier'
+        verbose_name_plural = 'Imputations Courriers'
+
+    def __str__(self):
+        return f"{self.user.username} - {self.courrier.reference} ({self.access_type})"
+
+class CourrierAnnexe(models.Model):
+    """Fichiers annexes attachés à un courrier"""
+    courrier = models.ForeignKey(Courrier, on_delete=models.CASCADE, related_name='annexes')
+    fichier = models.FileField(upload_to='courriers/annexes/')
+    nom = models.CharField(max_length=255)
+    uploaded_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='courrier_annexes')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = 'Annexe Courrier'
+
+    def __str__(self):
+        return f"{self.nom} — {self.courrier.reference}"
+
+
+class CourrierStatut(models.Model):
+    """Modèle pour suivre le statut et l'historique des courriers"""
+    STATUT_CHOICES = [
+        ('nouveau', 'Nouveau'),
+        ('en_cours', 'En cours de traitement'),
+        ('traite', 'Traité'),
+        ('archive', 'Archivé'),
+    ]
+    
+    courrier = models.ForeignKey(Courrier, on_delete=models.CASCADE, related_name='historique_statuts')
+    statut = models.CharField(max_length=20, choices=STATUT_CHOICES, default='nouveau')
+    commentaire = models.TextField(blank=True, null=True)
+    modifie_par = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='modifications_courrier')
+    date_modification = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        verbose_name = 'Statut Courrier'
+        verbose_name_plural = 'Statuts Courriers'
+        ordering = ['-date_modification']
+    
+    def __str__(self):
+        return f"{self.courrier.reference} - {self.statut} ({self.date_modification.strftime('%d/%m/%Y')})"
+
+class CourrierInstruction(models.Model):
+    """Bordereau d'imputation et d'instructions (reproduit le formulaire papier)"""
+    INSTRUCTION_CHOICES = [
+        ('urgent',            'Urgent'),
+        ('examen_reponse',    'Pour examen et projet de réponse'),
+        ('attribution',       'Pour attribution'),
+        ('traitement',        'Pour traitement'),
+        ('rediger_discours',  'Rédiger discours'),
+        ('classer_archiver',  'À classer/archiver'),
+        ('suivi',             'Pour suivi'),
+        ('note_sd_pip',       'Pour note au Sous-Directeur PIP'),
+        ('note_sd_dsp',       'Pour note au Sous-Directeur DSP'),
+        ('diffusion',         'Pour diffusion'),
+        ('information',       'Pour information'),
+        ('seance_travail',    'Pour en parler en séance de travail'),
+        ('participation',     'Pour participation'),
+        ('note_directrice',   'Pour note à la Directrice'),
+        ('autre',             'Autre'),
+    ]
+
+    courrier = models.ForeignKey(Courrier, on_delete=models.CASCADE, related_name='courrier_instructions')
+    instructions = models.JSONField(default=list, help_text='Liste des codes d\'instructions sélectionnées')
+    date_limite_reaction = models.DateField(null=True, blank=True)
+    commentaire = models.TextField(blank=True)
+    creee_par = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='instructions_creees')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Instruction Courrier'
+        verbose_name_plural = 'Instructions Courrier'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Instructions {self.courrier.reference} ({self.created_at.strftime('%d/%m/%Y')})"
+
+
+class CourrierRappel(models.Model):
+    """Modèle pour les rappels de traitement des courriers"""
+    courrier = models.ForeignKey(Courrier, on_delete=models.CASCADE, related_name='rappels')
+    utilisateur = models.ForeignKey(User, on_delete=models.CASCADE, related_name='rappels_courrier')
+    date_rappel = models.DateTimeField()
+    message = models.TextField()
+    envoye = models.BooleanField(default=False)
+    date_envoi = models.DateTimeField(null=True, blank=True)
+    cree_par = models.ForeignKey(User, on_delete=models.CASCADE, related_name='rappels_crees')
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        verbose_name = 'Rappel Courrier'
+        verbose_name_plural = 'Rappels Courriers'
+        ordering = ['date_rappel']
+    
+    def __str__(self):
+        return f"Rappel pour {self.courrier.reference} - {self.utilisateur.username}"
+
+class CourrierNotification(models.Model):
+    """Modèle pour les notifications liées aux courriers"""
+    TYPE_CHOICES = [
+        ('nouveau_courrier', 'Nouveau courrier reçu'),
+        ('courrier_impute', 'Courrier imputé'),
+        ('acces_accorde', 'Accès accordé'),
+        ('acces_revoque', 'Accès révoqué'),
+        ('rappel_traitement', 'Rappel de traitement'),
+        ('statut_modifie', 'Statut modifié'),
+        ('diligence_creee', 'Diligence créée'),
+        ('commentaire_ajoute', 'Commentaire ajouté'),
+    ]
+    
+    PRIORITE_CHOICES = [
+        ('basse', 'Basse'),
+        ('normale', 'Normale'),
+        ('haute', 'Haute'),
+        ('urgente', 'Urgente'),
+    ]
+    
+    utilisateur = models.ForeignKey(User, on_delete=models.CASCADE, related_name='notifications_courrier')
+    courrier = models.ForeignKey(Courrier, on_delete=models.CASCADE, related_name='notifications', null=True, blank=True)
+    type_notification = models.CharField(max_length=30, choices=TYPE_CHOICES)
+    titre = models.CharField(max_length=255)
+    message = models.TextField()
+    priorite = models.CharField(max_length=20, choices=PRIORITE_CHOICES, default='normale')
+    lue = models.BooleanField(default=False)
+    date_lecture = models.DateTimeField(null=True, blank=True)
+    cree_par = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='notifications_courrier_creees')
+    created_at = models.DateTimeField(auto_now_add=True)
+    metadata = models.JSONField(default=dict, blank=True)  # Données supplémentaires (IDs, références, etc.)
+    
+    class Meta:
+        verbose_name = 'Notification Courrier'
+        verbose_name_plural = 'Notifications Courriers'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['utilisateur', 'lue']),
+            models.Index(fields=['courrier']),
+            models.Index(fields=['-created_at']),
+        ]
+    
+    def __str__(self):
+        return f"{self.titre} - {self.utilisateur.username}"
+    
+    def marquer_comme_lue(self):
+        """Marquer la notification comme lue"""
+        from django.utils import timezone
+        self.lue = True
+        self.date_lecture = timezone.now()
+        self.save()
+
+class Diligence(models.Model):
+    TYPE_CHOICES = [
+        ('courrier', 'Basée sur courrier'),
+        ('spontanee', 'Spontanée'),
+    ]
+    
+    STATUT_CHOICES = [
+        ('en_attente', 'En attente'),
+        ('en_cours', 'En cours de traitement'),
+        ('en_correction', 'Demande de correction'),
+        ('demande_validation', 'Demande de validation'),
+        ('termine', 'Terminé'),
+        ('archivee', 'Archivée'),
+    ]
+    
+    CATEGORIE_CHOICES = [
+        ('URGENT', 'Urgent'),
+        ('NORMAL', 'Normal'),
+        ('BASSE', 'Basse priorité')
+    ]
+    
+    DOMAINE_CHOICES = [
+        ('representations', 'Représentations'),
+        ('projet_x', 'Projet X'),
+        ('projet_y', 'Projet Y'),
+        ('atelier', 'Atelier'),
+        ('evenements', 'Événements'),
+        ('formation', 'Formation'),
+        ('communication', 'Communication'),
+        ('logistique', 'Logistique'),
+        ('budget', 'Budget'),
+        ('autre', 'Autre'),
+    ]
+    
+    # Type de diligence
+    type_diligence = models.CharField(max_length=20, choices=TYPE_CHOICES, default='courrier')
+    
+    # Référence et courrier associé
+    reference_courrier = models.CharField(max_length=255)
+    courrier = models.ForeignKey(Courrier, on_delete=models.SET_NULL, null=True, blank=True, related_name='diligences')
+    
+    # Domaine pour archivage automatique
+    domaine = models.CharField(max_length=50, choices=DOMAINE_CHOICES, default='autre')
+    
+    # Informations de base
+    categorie = models.CharField(max_length=64)
+    statut = models.CharField(max_length=32, choices=STATUT_CHOICES, default='en_attente')
+    
+    # Délais d'exécution
+    date_limite = models.DateField(blank=True, null=True)
+    date_rappel_1 = models.DateField(blank=True, null=True, help_text="Premier rappel avant échéance")
+    date_rappel_2 = models.DateField(blank=True, null=True, help_text="Deuxième rappel avant échéance")
+    
+    # Progression
+    pourcentage_avancement = models.DecimalField(max_digits=5, decimal_places=2, default=0.00)
+    
+    # Fichiers et documents
+    fichier_joint = models.FileField(
+        upload_to='diligences/',
+        blank=True,
+        null=True,
+        max_length=500
+    )
+    
+    # Commentaires et instructions
+    commentaires = models.TextField(blank=True, null=True)
+    commentaires_agents = models.TextField(blank=True, null=True)
+    instructions = models.TextField(blank=True, null=True)
+    nouvelle_instruction = models.TextField(blank=True, null=True)
+    
+    # Informations du courrier (si applicable)
+    date_reception = models.DateField(blank=True, null=True)
+    expediteur = models.CharField(max_length=255, blank=True, null=True)
+    objet = models.TextField(blank=True, null=True)
+    
+    # Relations
+    agents = models.ManyToManyField(User, related_name='diligences')
+    services_concernes = models.ManyToManyField(Service, related_name='diligences_concernes')
+    direction = models.ForeignKey(Direction, on_delete=models.SET_NULL, null=True, blank=True, related_name='diligences')
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    archived_at = models.DateTimeField(null=True, blank=True)
+    archived_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='diligences_archived')
+    validated_at = models.DateTimeField(null=True, blank=True)
+    validated_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='diligences_validated')
+
+class ImputationAccess(models.Model):
+    ACCESS_TYPE_CHOICES = [
+        ('view', 'Lecture'),
+        ('edit', 'Édition'),
+    ]
+    diligence = models.ForeignKey('Diligence', on_delete=models.CASCADE, related_name='imputation_access')
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='imputation_access')
+    access_type = models.CharField(max_length=10, choices=ACCESS_TYPE_CHOICES, default='view')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ('diligence', 'user', 'access_type')
+
+    def __str__(self):
+        return f"{self.user.username} - {self.diligence} ({self.access_type})"
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    validated_at = models.DateTimeField(null=True, blank=True)
+    archived_at = models.DateTimeField(null=True, blank=True)
+    archived_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='diligences_archivees'
+    )
+
+
+    def __str__(self):
+        return f"{self.reference_courrier} - {self.direction.nom if self.direction else 'Sans direction'}"
+
+    def get_direction(self):
+        """Retourne la direction de la diligence, soit directement assignée soit via le service"""
+        if self.direction:
+            return self.direction
+        if self.services_concernes.exists():
+            return self.services_concernes.first().direction
+        return None
+
+# --- MODÈLE POUR GESTION DES DOCUMENTS DE DILIGENCE ---
+class DiligenceDocument(models.Model):
+    STATUT_CHOICES = [
+        ('brouillon', 'Brouillon'),
+        ('en_revision', 'En révision'),
+        ('valide', 'Validé'),
+        ('archive', 'Archivé'),
+    ]
+    
+    diligence = models.ForeignKey(Diligence, on_delete=models.CASCADE, related_name='documents')
+    titre = models.CharField(max_length=255)
+    contenu = models.TextField(blank=True, null=True, help_text="Contenu éditable directement dans l'application")
+    fichier = models.FileField(upload_to='diligence_documents/', blank=True, null=True)
+    statut = models.CharField(max_length=20, choices=STATUT_CHOICES, default='brouillon')
+    version = models.PositiveIntegerField(default=1)
+    
+    # Métadonnées
+    created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='documents_created')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    validated_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='documents_validated')
+    validated_at = models.DateTimeField(null=True, blank=True)
+    
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = 'Document de Diligence'
+        verbose_name_plural = 'Documents de Diligence'
+    
+    def __str__(self):
+        return f"{self.titre} - {self.diligence.reference_courrier} (v{self.version})"
+
+# --- MODÈLE POUR NOTIFICATIONS ---
+class DiligenceNotification(models.Model):
+    TYPE_CHOICES = [
+        ('rappel_delai', 'Rappel de délai'),
+        ('nouvelle_diligence', 'Nouvelle diligence'),
+        ('validation_requise', 'Validation requise'),
+        ('document_valide', 'Document validé'),
+        ('diligence_archivee', 'Diligence archivée'),
+        ('conges_validation', 'Validation de congé'),
+        ('conges_rejet', 'Rejet de congé'),
+        ('absences_validation', 'Validation d\'absence'),
+        ('absences_rejet', 'Rejet d\'absence'),
+    ]
+    
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='diligence_notifications')
+    diligence = models.ForeignKey(Diligence, on_delete=models.CASCADE, related_name='notifications', null=True, blank=True)
+    type_notification = models.CharField(max_length=30, choices=TYPE_CHOICES)
+    message = models.TextField()
+    lien = models.CharField(max_length=255, blank=True, default='')
+    read = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = 'Notification de Diligence'
+        verbose_name_plural = 'Notifications de Diligence'
+    
+    def __str__(self):
+        return f"{self.get_type_notification_display()} - {self.user.username}"
+
+class Notification(models.Model):
+    TYPES_NOTIF = [
+        ('demande_approuvee', 'Demande approuvée'),
+        ('demande_rejetee', 'Demande rejetée'),
+        ('nouvelle_demande', 'Nouvelle demande'),
+        ('rappel', 'Rappel'),
+    ]
+    
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='notifications')
+    type_notif = models.CharField(max_length=30, choices=TYPES_NOTIF, default='nouvelle_demande')
+    contenu = models.TextField(blank=True, null=True)
+    message = models.TextField(blank=True, null=True)  # Pour compatibilité
+    lien = models.CharField(max_length=255, blank=True, null=True)
+    read = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = 'Notification'
+        verbose_name_plural = 'Notifications'
+    
+    def __str__(self):
+        return f"{self.get_type_notif_display()} - {self.user.username} - {self.created_at.strftime('%d/%m/%Y %H:%M')}"
+
+class Observation(models.Model):
+    diligence = models.ForeignKey(Diligence, on_delete=models.CASCADE)
+    auteur = models.ForeignKey(User, on_delete=models.CASCADE)
+    texte = models.TextField()
+    date_observation = models.DateTimeField(auto_now_add=True)
+
+class Evenement(models.Model):
+    titre = models.CharField(max_length=255)
+    type = models.CharField(max_length=255)
+    lieu = models.CharField(max_length=255)
+    date_debut = models.DateField()
+    date_fin = models.DateField()
+    organisateur = models.ForeignKey(User, on_delete=models.CASCADE)
+    statut = models.CharField(max_length=64)
+
+class EtapeEvenement(models.Model):
+    evenement = models.ForeignKey(Evenement, on_delete=models.CASCADE)
+    nom_etape = models.CharField(max_length=255)
+    responsable = models.ForeignKey(User, on_delete=models.CASCADE)
+    statut = models.CharField(max_length=64)
+    date_echeance = models.DateField()
+
+#class Presence(models.Model):
+    #evenement = models.ForeignKey(Evenement, on_delete=models.CASCADE)
+    #participant = models.CharField(max_length=255)
+    #present = models.BooleanField()
+    #horodatage = models.DateTimeField(auto_now_add=True)
+
+class Prestataire(models.Model):
+    
+    secteur_activite = models.CharField(max_length=255)
+    zone_geographique = models.CharField(max_length=255)
+    email = models.EmailField()
+    telephone = models.CharField(max_length=32)
+    abonnement_actif = models.BooleanField(default=False)
+    profil_complet = models.TextField()
+    note_moyenne = models.FloatField(default=0)
+
+class PrestataireEtape(models.Model):
+    prestataire = models.ForeignKey(Prestataire, on_delete=models.CASCADE)
+    etape = models.ForeignKey(EtapeEvenement, on_delete=models.CASCADE)
+    statut = models.CharField(max_length=64)
+    commission = models.DecimalField(max_digits=10, decimal_places=2)
+
+class Evaluation(models.Model):
+    prestataire = models.ForeignKey(Prestataire, on_delete=models.CASCADE)
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    note = models.IntegerField()
+    commentaire = models.TextField()
+    date_evaluation = models.DateTimeField(auto_now_add=True)
+
+
+# --- MODULE GESTION D'ACTIVITE ---
+
+class Activite(models.Model):
+    TYPE_CHOICES = [
+        ('atelier', 'Atelier'),
+        ('seminaire', 'Séminaire'),
+        ('colloque', 'Colloque'),
+        ('reunion', 'Réunion'),
+        ('ceremonie', 'Cérémonie'),
+        ('autre', 'Autre'),
+    ]
+    
+    ETAT_CHOICES = [
+        ('planifiee', 'Planifiée'),
+        ('en_cours', 'En cours'),
+        ('terminee', 'Terminée'),
+        ('suspendue', 'Suspendue'),
+    ]
+    
+    nom = models.CharField(max_length=255)
+    description = models.TextField(blank=True, null=True)
+    type_activite = models.CharField(max_length=20, choices=TYPE_CHOICES, default='autre')
+    service = models.ForeignKey('Service', on_delete=models.PROTECT, null=True, blank=True)
+    responsable_principal = models.ForeignKey(User, related_name='activites_responsable', on_delete=models.SET_NULL, null=True)
+    date_debut = models.DateField()
+    date_fin_prevue = models.DateField()
+    date_fin_effective = models.DateField(blank=True, null=True)
+    etat = models.CharField(max_length=20, choices=ETAT_CHOICES, default='planifiee')
+    lieu = models.CharField(max_length=255, blank=True, null=True)
+    budget_previsionnel = models.DecimalField(max_digits=12, decimal_places=2, blank=True, null=True)
+    nombre_participants_prevu = models.IntegerField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.nom} ({self.get_type_activite_display()})"
+
+    class Meta:
+        verbose_name = "Activité"
+        verbose_name_plural = "Activités"
+
+class Domaine(models.Model):
+    """Domaines/Commissions pour subdiviser une activité"""
+    nom = models.CharField(max_length=255)
+    description = models.TextField(blank=True, null=True)
+    activite = models.ForeignKey(Activite, related_name='domaines', on_delete=models.CASCADE)
+    superviseur = models.ForeignKey(User, related_name='domaines_supervises', on_delete=models.SET_NULL, null=True)
+    date_debut = models.DateField()
+    date_fin_prevue = models.DateField()
+    date_fin_effective = models.DateField(blank=True, null=True)
+    pourcentage_avancement = models.DecimalField(max_digits=5, decimal_places=2, default=0.00)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.nom} - {self.activite.nom}"
+
+    class Meta:
+        verbose_name = "Domaine"
+        verbose_name_plural = "Domaines"
+
+# Garder le modèle Projet pour compatibilité (sera migré progressivement)
+class Projet(models.Model):
+    nom = models.CharField(max_length=255)
+    description = models.TextField(blank=True, null=True)
+    direction = models.ForeignKey('Direction', on_delete=models.PROTECT, null=True, blank=True)
+    service = models.ForeignKey('Service', on_delete=models.PROTECT, null=True, blank=True)
+    ETAT_CHOICES = [
+        ('planifie', 'Planifié'),
+        ('en_cours', 'En cours'),
+        ('termine', 'Terminé'),
+        ('suspendu', 'Suspendu'),
+    ]
+    dateDebut = models.DateField()
+    dateFinPrevue = models.DateField()
+    dateFinEffective = models.DateField(blank=True, null=True)
+    etat = models.CharField(max_length=20, choices=ETAT_CHOICES, default='planifie')
+    responsable = models.ForeignKey(User, related_name='projets_responsable', on_delete=models.SET_NULL, null=True)
+    membres = models.ManyToManyField(User, related_name='projets_membre', blank=True)
+    createdAt = models.DateTimeField(auto_now_add=True)
+    updatedAt = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return self.nom
+
+class Tache(models.Model):
+    # Relations avec les nouveaux modèles
+    domaine = models.ForeignKey(Domaine, related_name='taches', on_delete=models.CASCADE, null=True, blank=True)
+    # Garder projet pour compatibilité
+    projet = models.ForeignKey(Projet, on_delete=models.CASCADE, null=True, blank=True)
+    
+    titre = models.CharField(max_length=255)
+    description = models.TextField(blank=True, null=True)
+    responsable = models.ForeignKey(User, related_name='taches_responsable', on_delete=models.SET_NULL, null=True)
+    
+    # Support pour les sous-tâches
+    tache_parent = models.ForeignKey('self', related_name='sous_taches', on_delete=models.CASCADE, null=True, blank=True)
+    
+    ETAT_CHOICES = [
+        ('a_faire', 'À faire'),
+        ('en_attente', 'En attente'),
+        ('en_cours', 'En cours'),
+        ('terminee', 'Terminée'),
+        ('annulee', 'Annulée'),
+    ]
+    PRIORITE_CHOICES = [
+        ('basse', 'Basse'),
+        ('moyenne', 'Moyenne'),
+        ('haute', 'Haute'),
+    ]
+    
+    etat = models.CharField(max_length=20, choices=ETAT_CHOICES, default='a_faire')
+    priorite = models.CharField(max_length=20, choices=PRIORITE_CHOICES, default='moyenne')
+    date_debut = models.DateField(null=True, blank=True)
+    date_fin_prevue = models.DateField(null=True, blank=True)
+    date_fin_effective = models.DateField(null=True, blank=True)
+    pourcentage_avancement = models.DecimalField(max_digits=5, decimal_places=2, default=0.00)
+    
+    # Champs pour compatibilité avec l'ancien système
+    directeurs = models.ManyToManyField(
+        User, related_name='directeurs_taches', blank=True
+    )
+    superieurs = models.ManyToManyField(
+        User, related_name='superieurs_taches', blank=True
+    )
+    agents = models.ManyToManyField(
+        User, related_name='agents_taches', blank=True
+    )
+    secretaires = models.ManyToManyField(
+        User, related_name='secretaires_taches', blank=True
+    )
+    
+    # Liens agenda
+    reunions = models.ManyToManyField(
+        'Reunion', related_name='taches', blank=True,
+        verbose_name='Réunions liées'
+    )
+    rendezvous_lies = models.ManyToManyField(
+        'RendezVous', related_name='taches', blank=True,
+        verbose_name='Rendez-vous liés'
+    )
+
+    # Champs de dates et timestamps
+    createdAt = models.DateTimeField(auto_now_add=True)
+    updatedAt = models.DateTimeField(auto_now=True)
+    
+    def __str__(self):
+        if self.domaine:
+            return f"{self.titre} ({self.domaine.nom})"
+        elif self.projet:
+            return f"{self.titre} ({self.projet.nom})"
+        return self.titre
+    
+    @property
+    def is_sous_tache(self):
+        return self.tache_parent is not None
+    
+    def get_niveau_hierarchie(self):
+        """Retourne le niveau hiérarchique de la tâche (0=tâche principale, 1=sous-tâche, etc.)"""
+        niveau = 0
+        parent = self.tache_parent
+        while parent:
+            niveau += 1
+            parent = parent.tache_parent
+        return niveau
+
+class Commentaire(models.Model):
+    contenu = models.TextField()
+    auteur = models.ForeignKey(User, related_name='commentaires', on_delete=models.CASCADE)
+    tache = models.ForeignKey(Tache, related_name='commentaires', on_delete=models.CASCADE)
+    createdAt = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.auteur.username}: {self.contenu[:30]}..."
+
+class Fichier(models.Model):
+    nom = models.CharField(max_length=255)
+    url = models.URLField()
+    type = models.CharField(max_length=100)
+    taille = models.IntegerField()
+    tache = models.ForeignKey(Tache, related_name='fichiers', on_delete=models.SET_NULL, null=True, blank=True)
+    projet = models.ForeignKey(Projet, related_name='fichiers', on_delete=models.SET_NULL, null=True, blank=True)
+
+    def __str__(self):
+        return self.nom
+
+class TacheHistorique(models.Model):
+    tache = models.ForeignKey('Tache', related_name='historiques', on_delete=models.CASCADE)
+    utilisateur = models.ForeignKey(User, null=True, on_delete=models.SET_NULL)
+    action = models.CharField(max_length=255)
+    details = models.TextField(blank=True, null=True)
+    date = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.tache} - {self.action} - {self.date.strftime('%Y-%m-%d %H:%M')}"
+
+# --- Modèle Agent (système multi-sites, QR, connexion, etc.) ---
+from django.contrib.auth.models import User
+
+from django.core.exceptions import ValidationError
+
+class Bureau(models.Model):
+    nom = models.CharField(max_length=255, unique=True, help_text="Nom ou référence du bureau")
+    latitude_centre = models.DecimalField(max_digits=10, decimal_places=7, help_text="Latitude du centre du bureau")
+    longitude_centre = models.DecimalField(max_digits=10, decimal_places=7, help_text="Longitude du centre du bureau")
+    rayon_metres = models.IntegerField(help_text="Rayon de la zone autorisée en mètres")
+
+    def clean(self):
+        # Validation avancée : coordonnées uniques
+        if Bureau.objects.exclude(pk=self.pk).filter(latitude_centre=self.latitude_centre, longitude_centre=self.longitude_centre).exists():
+            raise ValidationError("Un bureau existe déjà à ces coordonnées GPS.")
+
+    def delete(self, *args, **kwargs):
+        if self.agent_set.exists():
+            raise ValidationError("Ce bureau est encore lié à des agents et ne peut pas être supprimé.")
+        super().delete(*args, **kwargs)
+
+    def __str__(self):
+        return self.nom
+
+class Agent(models.Model):
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='agent_profile')
+    nom = models.CharField(max_length=255)
+    prenom = models.CharField(max_length=255, blank=True, null=True)
+    telephone = models.CharField(max_length=30, blank=True, null=True)
+    matricule = models.CharField(max_length=100, unique=True)
+    poste = models.CharField(max_length=100)
+    service = models.ForeignKey('Service', on_delete=models.CASCADE, null=True, blank=True, help_text="Service de rattachement")
+    bureau = models.ForeignKey('Bureau', on_delete=models.SET_NULL, null=True, blank=True, help_text="Bureau de rattachement de l'agent")
+    empreinte_hash = models.TextField(null=True, blank=True, help_text="Hash de l'empreinte digitale de l'agent")
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(default=timezone.now)
+
+    def save(self, *args, **kwargs):
+        if not self.created_at:
+            self.created_at = timezone.now()
+        self.updated_at = timezone.now()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.nom} {self.prenom or ''} ({self.poste})"
+
+
+class Presence(models.Model):
+    STATUT_CHOICES = [
+        ('présent', 'Présent'),
+        ('absent', 'Absent'),
+        ('en mission', 'En mission'),
+        ('permission accordée', 'Permission accordée'),
+    ]
+    # id: UUID ou BigAutoField (par défaut)
+    agent = models.ForeignKey('Agent', on_delete=models.CASCADE, related_name='presences')
+    date_presence = models.DateField()
+    heure_arrivee = models.TimeField(null=True, blank=True)
+    heure_depart = models.TimeField(null=True, blank=True)
+    statut = models.CharField(max_length=32, choices=STATUT_CHOICES)
+    # empreinte_hash removed - using simple button presence now
+    latitude = models.DecimalField(max_digits=10, decimal_places=6)
+    longitude = models.DecimalField(max_digits=10, decimal_places=6)
+    localisation_valide = models.BooleanField(default=False)
+    device_fingerprint = models.CharField(max_length=64, null=True, blank=True, help_text="Empreinte unique du téléphone")
+    commentaire = models.TextField(null=True, blank=True)
+    
+    # Nouveaux champs pour le suivi des sorties
+    heure_sortie = models.TimeField(null=True, blank=True, help_text="Heure de sortie automatique (éloignement > 200m)")
+    sortie_detectee = models.BooleanField(default=False, help_text="Sortie détectée par géolocalisation")
+    temps_absence_minutes = models.IntegerField(null=True, blank=True, help_text="Durée d'absence en minutes")
+    statut_modifiable = models.BooleanField(default=True, help_text="Le statut peut être modifié par le supérieur")
+
+    # Suivi de l'absence prolongée (>1h hors de la zone GPS du site) : dernière position connue + trace
+    derniere_latitude_connue = models.DecimalField(
+        max_digits=10, decimal_places=6, null=True, blank=True,
+        help_text="Latitude de la dernière position connue de l'agent pendant son absence"
+    )
+    derniere_longitude_connue = models.DecimalField(
+        max_digits=10, decimal_places=6, null=True, blank=True,
+        help_text="Longitude de la dernière position connue de l'agent pendant son absence"
+    )
+    trace_absence = models.JSONField(
+        null=True, blank=True,
+        help_text="Historique des positions GPS ([{latitude, longitude, timestamp, distance_metres}, ...]) relevées depuis le début de l'absence"
+    )
+
+    # Pointage hors-ligne : identifiant genere cote mobile pour deduplication
+    # idempotente lors de la resynchronisation, et horodatage reel de capture
+    # (distinct de created_at, qui reste l'heure d'enregistrement serveur).
+    local_id = models.UUIDField(
+        null=True, blank=True, unique=True,
+        help_text="Identifiant genere par l'app mobile pour deduplier une resynchronisation hors-ligne"
+    )
+    captured_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text="Horodatage reel de capture du pointage sur l'appareil (peut preceder created_at en cas de synchronisation differee)"
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Présence'
+        verbose_name_plural = 'Présences'
+        unique_together = ('agent', 'date_presence')
+        ordering = ['-date_presence', '-heure_arrivee']
+
+    def __str__(self):
+        return f"{self.agent.username} - {self.date_presence} ({self.statut})"
+
+
+class OccurrenceSpeciale(models.Model):
+    """Modèle pour gérer les occurrences spéciales (représentations, missions, permissions, etc.)"""
+    TYPE_CHOICES = [
+        ('REP1', 'Représentation demi-journée'),
+        ('REP2', 'Représentation journée entière'),
+        ('M1', 'Mission à l\'intérieur'),
+        ('M2', 'Mission à l\'extérieur'),
+        ('C', 'Congé'),
+        ('T', 'Télétravail'),
+        ('F', 'Férié'),
+        ('P1', 'Permission demi-journée'),
+        ('P2', 'Permission journée entière'),
+        ('ABS', 'Absence non justifiée'),
+    ]
+    
+    STATUT_CHOICES = [
+        ('permission', 'Permission'),
+        ('en mission', 'En mission'),
+        ('congé', 'Congé'),
+        ('télétravail', 'Télétravail'),
+        ('férié', 'Férié'),
+        ('absent', 'Absent'),
+    ]
+    
+    agent = models.ForeignKey(User, on_delete=models.CASCADE, related_name='occurrences_speciales')
+    type_occurrence = models.CharField(max_length=10, choices=TYPE_CHOICES)
+    nom_occurrence = models.CharField(max_length=100)
+    statut = models.CharField(max_length=32, choices=STATUT_CHOICES)
+    date = models.DateField(null=True, blank=True, help_text="Date unique (ancienne version)")
+    date_debut = models.DateField(null=True, blank=True, help_text="Date de début de l'occurrence")
+    date_fin = models.DateField(null=True, blank=True, help_text="Date de fin de l'occurrence")
+    heure_debut = models.TimeField(null=True, blank=True, help_text="Heure de début (pour demi-journée)")
+    heure_fin = models.TimeField(null=True, blank=True, help_text="Heure de fin (pour demi-journée)")
+    createur = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='occurrences_creees')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        verbose_name = 'Occurrence spéciale'
+        verbose_name_plural = 'Occurrences spéciales'
+        ordering = ['-date', '-created_at']
+    
+    def __str__(self):
+        return f"{self.agent.username} - {self.nom_occurrence} - {self.date}"
+
+
+class DeviceRegistration(models.Model):
+    """Modèle pour enregistrer les appareils autorisés par utilisateur"""
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='registered_devices')
+    device_fingerprint = models.CharField(max_length=64, unique=True, help_text="Empreinte unique du téléphone")
+    device_name = models.CharField(max_length=100, blank=True, help_text="Nom de l'appareil (optionnel)")
+    first_used = models.DateTimeField(auto_now_add=True)
+    last_used = models.DateTimeField(auto_now=True)
+    is_active = models.BooleanField(default=True)
+    
+    class Meta:
+        verbose_name = 'Appareil enregistré'
+        verbose_name_plural = 'Appareils enregistrés'
+        unique_together = ('user', 'device_fingerprint')
+    
+    def __str__(self):
+        return f"{self.user.username} - {self.device_fingerprint[:8]}..."
+
+    def save(self, *args, **kwargs):
+        # TODO: Calcul automatique du statut selon la logique métier (voir doc)
+        # TODO: Calcul de localisation_valide selon distance GPS
+        super().save(*args, **kwargs)
+
+# --- RolePermission for editable roles/permissions ---
+class RolePermission(models.Model):
+    ROLE_CHOICES = [
+        ('ADMIN', 'Admin'),
+        ('DIRECTEUR', 'Directeur'),
+        ('SOUS_DIRECTEUR', 'Sous-Directeur'),
+        ('CHEF_SERVICE', 'Chef de Service'),
+        ('SUPERIEUR', 'Superieur'),
+        ('AGENT', 'Agent'),
+        ('SECRETAIRE', 'Secretaire'),
+        ('PRESTATAIRE', 'Prestataire'),
+    ]
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES)
+    permission = models.CharField(max_length=100)
+    description = models.CharField(max_length=255, blank=True, null=True)
+
+    class Meta:
+        unique_together = ('role', 'permission')
+        verbose_name = 'Role Permission'
+        verbose_name_plural = 'Role Permissions'
+
+    def __str__(self):
+        return f"{self.role} - {self.permission}"
+
+
+class UserDiligenceComment(models.Model):
+    """Commentaires spécifiques par utilisateur et par diligence"""
+    diligence = models.ForeignKey('Diligence', on_delete=models.CASCADE, related_name='user_comments')
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='diligence_comments')
+    comment = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ('diligence', 'user')
+        verbose_name = 'User Diligence Comment'
+        verbose_name_plural = 'User Diligence Comments'
+
+    def __str__(self):
+        return f"Comment by {self.user.username} on Diligence #{self.diligence.id}"
+
+
+class UserDiligenceInstruction(models.Model):
+    """Instructions spécifiques par utilisateur et par diligence"""
+    diligence = models.ForeignKey('Diligence', on_delete=models.CASCADE, related_name='user_instructions')
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='diligence_instructions')
+    instruction = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ('diligence', 'user')
+        verbose_name = 'User Diligence Instruction'
+        verbose_name_plural = 'User Diligence Instructions'
+
+    def __str__(self):
+        return f"Instruction by {self.user.username} for Diligence #{self.diligence.id}"
+
+
+class DemandeConge(models.Model):
+    """Modèle pour les demandes de congé des agents"""
+    TYPE_CONGE_CHOICES = [
+        ('annuel', 'Congé annuel'),
+        ('maladie', 'Congé maladie'),
+        ('maternite', 'Congé maternité'),
+        ('paternite', 'Congé paternité'),
+        ('sans_solde', 'Congé sans solde'),
+        ('formation', 'Congé formation'),
+        ('exceptionnel', 'Congé exceptionnel'),
+    ]
+    
+    STATUT_CHOICES = [
+        ('en_attente', 'En attente'),
+        ('approuve', 'Approuvé'),
+        ('rejete', 'Rejeté'),
+        ('annule', 'Annulé'),
+    ]
+    
+    demandeur = models.ForeignKey(User, on_delete=models.CASCADE, related_name='demandes_conge')
+    
+    # Informations personnelles
+    matricule = models.CharField(max_length=50, default='', help_text="Matricule de l'agent")
+    emploi = models.CharField(max_length=100, default='', help_text="Emploi occupé")
+    fonction = models.CharField(max_length=100, default='', help_text="Fonction exercée")
+    
+    type_conge = models.CharField(max_length=20, choices=TYPE_CONGE_CHOICES)
+    date_debut = models.DateField()
+    date_fin = models.DateField()
+    nombre_jours = models.PositiveIntegerField()
+    motif = models.TextField()
+    adresse_conge = models.TextField(help_text="Adresse pendant le congé")
+    telephone_conge = models.CharField(max_length=20, help_text="Téléphone pendant le congé")
+    
+    # Validation hiérarchique
+    directeur = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='conges_directeur', help_text="Directeur sélectionné")
+    superieur = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='conges_superieur', help_text="Supérieur hiérarchique sélectionné")
+    superieur_hierarchique = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='conges_a_valider')
+    statut = models.CharField(max_length=20, choices=STATUT_CHOICES, default='en_attente')
+    date_validation = models.DateTimeField(null=True, blank=True)
+    commentaire_validation = models.TextField(blank=True, null=True)
+    
+    # Documents
+    document_demande = models.FileField(upload_to='conges/demandes/', null=True, blank=True)
+    document_reponse = models.FileField(upload_to='conges/reponses/', null=True, blank=True)
+    
+    # Agents concernés (même direction/service)
+    agents_concernes = models.ManyToManyField(User, blank=True, related_name='conges_concernes', help_text="Agents de la même direction/service informés de ce congé")
+    
+    # Métadonnées
+    date_creation = models.DateTimeField(auto_now_add=True)
+    date_modification = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        verbose_name = 'Demande de congé'
+        verbose_name_plural = 'Demandes de congé'
+        ordering = ['-date_creation']
+    
+    def __str__(self):
+        return f"Congé {self.type_conge} - {self.demandeur.username} ({self.date_debut} au {self.date_fin})"
+    
+    def save(self, *args, **kwargs):
+        # Calculer automatiquement le nombre de jours
+        if self.date_debut and self.date_fin:
+            self.nombre_jours = (self.date_fin - self.date_debut).days + 1
+        super().save(*args, **kwargs)
+
+
+class DemandeAbsence(models.Model):
+    """Modèle pour les demandes d'autorisation d'absence"""
+    TYPE_ABSENCE_CHOICES = [
+        ('personnelle', 'Raison personnelle'),
+        ('medicale', 'Rendez-vous médical'),
+        ('familiale', 'Raison familiale'),
+        ('administrative', 'Démarche administrative'),
+        ('formation', 'Formation'),
+        ('mission', 'Mission'),
+        ('autre', 'Autre'),
+    ]
+    
+    STATUT_CHOICES = [
+        ('en_attente', 'En attente'),
+        ('approuve', 'Approuvé'),
+        ('rejete', 'Rejeté'),
+        ('annule', 'Annulé'),
+    ]
+    
+    demandeur = models.ForeignKey(User, on_delete=models.CASCADE, related_name='demandes_absence')
+    
+    # Informations personnelles
+    matricule = models.CharField(max_length=50, default='', help_text="Matricule de l'agent")
+    emploi = models.CharField(max_length=100, default='', help_text="Emploi occupé")
+    fonction = models.CharField(max_length=100, default='', help_text="Fonction exercée")
+    
+    type_absence = models.CharField(max_length=20, choices=TYPE_ABSENCE_CHOICES)
+    date_debut = models.DateTimeField()
+    date_fin = models.DateTimeField()
+    duree_heures = models.DecimalField(max_digits=4, decimal_places=2, help_text="Durée en heures")
+    motif = models.TextField()
+    
+    # Validation hiérarchique
+    directeur = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='absences_directeur', help_text="Directeur sélectionné")
+    superieur = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='absences_superieur', help_text="Supérieur hiérarchique sélectionné")
+    superieur_hierarchique = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='absences_a_valider')
+    statut = models.CharField(max_length=20, choices=STATUT_CHOICES, default='en_attente')
+    date_validation = models.DateTimeField(null=True, blank=True)
+    commentaire_validation = models.TextField(blank=True, null=True)
+    
+    # Documents
+    document_demande = models.FileField(upload_to='absences/demandes/', null=True, blank=True)
+    document_reponse = models.FileField(upload_to='absences/reponses/', null=True, blank=True)
+    
+    # Agents concernés (même direction/service)
+    agents_concernes = models.ManyToManyField(User, blank=True, related_name='absences_concernes', help_text="Agents de la même direction/service informés de cette absence")
+    
+    # Métadonnées
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        verbose_name = 'Demande d\'absence'
+        verbose_name_plural = 'Demandes d\'absence'
+        ordering = ['-created_at']
+    
+    def __str__(self):
+        return f"Absence {self.type_absence} - {self.demandeur.username} ({self.date_debut.strftime('%d/%m/%Y %H:%M')})"
+    
+    def save(self, *args, **kwargs):
+        # Calculer automatiquement la durée en heures
+        if self.date_debut and self.date_fin:
+            delta = self.date_fin - self.date_debut
+            self.duree_heures = delta.total_seconds() / 3600
+        super().save(*args, **kwargs)
+
+
+# --- MODÈLES POUR GÉOFENCING ET ALERTES ---
+
+class GeofenceAlert(models.Model):
+    """Modèle pour les alertes de géofencing lorsqu'un agent sort de la zone autorisée"""
+    ALERT_TYPE_CHOICES = [
+        ('sortie_zone', 'Sortie de zone'),
+        ('entree_zone', 'Entrée en zone'),
+        ('hors_horaires', 'Hors horaires de travail'),
+        ('absence_prolongee', 'Absence prolongée (>1h)'),
+    ]
+    
+    STATUT_CHOICES = [
+        ('active', 'Active'),
+        ('resolue', 'Résolue'),
+        ('ignoree', 'Ignorée'),
+    ]
+    
+    agent = models.ForeignKey(User, on_delete=models.CASCADE, related_name='geofence_alerts')
+    bureau = models.ForeignKey('Bureau', on_delete=models.CASCADE, related_name='geofence_alerts')
+    type_alerte = models.CharField(max_length=20, choices=ALERT_TYPE_CHOICES, default='sortie_zone')
+    
+    # Position de l'agent au moment de l'alerte
+    latitude_agent = models.DecimalField(max_digits=22, decimal_places=17)
+    longitude_agent = models.DecimalField(max_digits=22, decimal_places=17)
+    distance_metres = models.IntegerField(help_text="Distance en mètres par rapport au centre du bureau")
+    
+    # Informations temporelles
+    timestamp_alerte = models.DateTimeField(auto_now_add=True)
+    heure_detection = models.TimeField(auto_now_add=True)
+    date_detection = models.DateField(auto_now_add=True)
+    
+    # Contexte de l'alerte
+    en_heures_travail = models.BooleanField(default=True, help_text="True si l'alerte s'est produite pendant les heures de travail")
+    message_alerte = models.TextField(blank=True, null=True)
+    
+    # Statut et résolution
+    statut = models.CharField(max_length=20, choices=STATUT_CHOICES, default='active')
+    resolu_par = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='geofence_alerts_resolues')
+    date_resolution = models.DateTimeField(null=True, blank=True)
+    commentaire_resolution = models.TextField(blank=True, null=True)
+    
+    # Notifications envoyées
+    notification_envoyee = models.BooleanField(default=False)
+    notification_push_envoyee = models.BooleanField(default=False)
+
+    # Suivi des absences prolongées (>1h) : durée et trace GPS
+    duree_hors_zone_minutes = models.IntegerField(
+        null=True, blank=True,
+        help_text="Durée continue (en minutes) pendant laquelle l'agent est resté hors de la zone autorisée"
+    )
+    trace_positions = models.JSONField(
+        null=True, blank=True,
+        help_text="Historique des positions GPS ([{latitude, longitude, timestamp, distance_metres}, ...]) relevées pendant l'absence"
+    )
+
+    class Meta:
+        verbose_name = 'Alerte de géofencing'
+        verbose_name_plural = 'Alertes de géofencing'
+        ordering = ['-timestamp_alerte']
+        indexes = [
+            models.Index(fields=['agent', 'date_detection']),
+            models.Index(fields=['bureau', 'timestamp_alerte']),
+            models.Index(fields=['statut', 'en_heures_travail']),
+        ]
+
+    def __str__(self):
+        return f"Alerte {self.get_type_alerte_display()} - {self.agent.username} - {self.timestamp_alerte.strftime('%d/%m/%Y %H:%M')}"
+
+    def save(self, *args, **kwargs):
+        # Générer automatiquement le message d'alerte
+        if not self.message_alerte:
+            if self.type_alerte == 'sortie_zone':
+                self.message_alerte = f"{self.agent.get_full_name() or self.agent.username} s'est éloigné(e) de {self.distance_metres}m du bureau {self.bureau.nom}"
+            elif self.type_alerte == 'entree_zone':
+                self.message_alerte = f"{self.agent.get_full_name() or self.agent.username} est entré(e) dans la zone du bureau {self.bureau.nom}"
+            elif self.type_alerte == 'hors_horaires':
+                self.message_alerte = f"{self.agent.get_full_name() or self.agent.username} est détecté(e) hors des heures de travail"
+            elif self.type_alerte == 'absence_prolongee':
+                duree = self.duree_hors_zone_minutes or 0
+                heures = duree // 60
+                minutes = duree % 60
+                duree_str = f"{heures}h{minutes:02d}" if heures else f"{minutes} min"
+                self.message_alerte = (
+                    f"{self.agent.get_full_name() or self.agent.username} est absent(e) de {self.bureau.nom} "
+                    f"depuis {duree_str} (à {self.distance_metres}m)"
+                )
+
+        super().save(*args, **kwargs)
+
+
+class GeofenceSettings(models.Model):
+    """Configuration globale du système de géofencing"""
+    
+    # Heures de travail
+    heure_debut_matin = models.TimeField(default='07:30', help_text="Début des heures de travail du matin")
+    heure_fin_matin = models.TimeField(default='12:30', help_text="Fin des heures de travail du matin")
+    heure_debut_apres_midi = models.TimeField(default='13:30', help_text="Début des heures de travail de l'après-midi")
+    heure_fin_apres_midi = models.TimeField(default='16:30', help_text="Fin des heures de travail de l'après-midi")
+    
+    # Configuration des alertes
+    distance_alerte_metres = models.IntegerField(default=200, help_text="Distance en mètres pour déclencher une alerte")
+    duree_minimale_hors_bureau_minutes = models.IntegerField(default=5, help_text="Durée minimale hors du bureau en minutes avant alerte")
+    frequence_verification_minutes = models.IntegerField(default=5, help_text="Fréquence de vérification de la position en minutes")
+    seuil_absence_prolongee_minutes = models.IntegerField(
+        default=60,
+        help_text="Durée continue (en minutes) hors de la zone du site au-delà de laquelle une absence prolongée est détectée, tracée et notifiée (défaut : 60 min = 1h)"
+    )
+    
+    # Jours de travail
+    lundi_travaille = models.BooleanField(default=True)
+    mardi_travaille = models.BooleanField(default=True)
+    mercredi_travaille = models.BooleanField(default=True)
+    jeudi_travaille = models.BooleanField(default=True)
+    vendredi_travaille = models.BooleanField(default=True)
+    samedi_travaille = models.BooleanField(default=False)
+    dimanche_travaille = models.BooleanField(default=False)
+    
+    # Notifications
+    notification_directeurs = models.BooleanField(default=True, help_text="Envoyer des notifications aux directeurs")
+    notification_superieurs = models.BooleanField(default=True, help_text="Envoyer des notifications aux supérieurs")
+    notification_push_active = models.BooleanField(default=True, help_text="Activer les notifications push")
+    
+    # Métadonnées
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        verbose_name = 'Configuration géofencing'
+        verbose_name_plural = 'Configurations géofencing'
+    
+    def __str__(self):
+        return f"Configuration géofencing - Modifiée le {self.updated_at.strftime('%d/%m/%Y %H:%M')}"
+    
+    def is_heure_travail(self, datetime_obj):
+        """Vérifie si une datetime donnée est dans les heures de travail"""
+        jour_semaine = datetime_obj.weekday()  # 0=lundi, 6=dimanche
+        heure = datetime_obj.time()
+        
+        # Vérifier si c'est un jour de travail
+        jours_travail = [
+            self.lundi_travaille, self.mardi_travaille, self.mercredi_travaille,
+            self.jeudi_travaille, self.vendredi_travaille, self.samedi_travaille,
+            self.dimanche_travaille
+        ]
+        
+        if not jours_travail[jour_semaine]:
+            return False
+        
+        # Vérifier les heures
+        return (self.heure_debut_matin <= heure <= self.heure_fin_matin) or \
+               (self.heure_debut_apres_midi <= heure <= self.heure_fin_apres_midi)
+
+
+class AgentLocation(models.Model):
+    """Modèle pour stocker l'historique des positions des agents"""
+    agent = models.ForeignKey(User, on_delete=models.CASCADE, related_name='locations')
+    latitude = models.DecimalField(max_digits=22, decimal_places=17)
+    longitude = models.DecimalField(max_digits=22, decimal_places=17)
+    accuracy = models.FloatField(null=True, blank=True, help_text="Précision GPS en mètres")
+    
+    # Informations contextuelles
+    timestamp = models.DateTimeField(auto_now_add=True)
+    is_background = models.BooleanField(default=False, help_text="Position capturée en arrière-plan")
+    battery_level = models.IntegerField(null=True, blank=True, help_text="Niveau de batterie du téléphone")
+
+    # Pointage hors-ligne : identifiant genere cote mobile pour deduplication
+    # des pings resynchronises, et horodatage reel de capture (distinct de
+    # timestamp, qui reste auto_now_add = heure de reception serveur).
+    local_id = models.UUIDField(
+        null=True, blank=True, unique=True,
+        help_text="Identifiant genere par l'app mobile pour deduplier un ping GPS resynchronise"
+    )
+    captured_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text="Horodatage reel de capture de la position sur l'appareil (peut preceder timestamp en cas de synchronisation differee)"
+    )
+
+    # Calculs automatiques
+    distance_bureau = models.FloatField(null=True, blank=True, help_text="Distance calculée par rapport au bureau assigné")
+    dans_zone_autorisee = models.BooleanField(default=True)
+
+    class Meta:
+        verbose_name = 'Position agent'
+        verbose_name_plural = 'Positions agents'
+        ordering = ['-timestamp']
+        indexes = [
+            models.Index(fields=['agent', 'timestamp']),
+            models.Index(fields=['timestamp', 'dans_zone_autorisee']),
+        ]
+    
+    def __str__(self):
+        return f"{self.agent.username} - {self.timestamp.strftime('%d/%m/%Y %H:%M:%S')}"
+
+
+class DeviceLock(models.Model):
+    """Modèle pour verrouiller un appareil à un utilisateur"""
+    device_id = models.CharField(max_length=255, unique=True, db_index=True, help_text="Empreinte unique de l'appareil")
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='locked_devices')
+    username = models.CharField(max_length=150)
+    email = models.EmailField()
+    locked_at = models.DateTimeField(auto_now_add=True)
+    last_used = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'device_locks'
+        verbose_name = 'Device Lock'
+        verbose_name_plural = 'Device Locks'
+    
+    def __str__(self):
+        return f"{self.device_id} → {self.username}"
+
+
+class PushNotificationToken(models.Model):
+    """Modèle pour stocker les tokens de notification push des utilisateurs"""
+    PLATFORM_CHOICES = [
+        ('android', 'Android'),
+        ('ios', 'iOS'),
+        ('web', 'Web'),
+    ]
+    
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='push_tokens')
+    token = models.CharField(max_length=255, unique=True, help_text="Token FCM/APNS")
+    platform = models.CharField(max_length=10, choices=PLATFORM_CHOICES)
+    device_id = models.CharField(max_length=255, blank=True, null=True)
+    
+    # Métadonnées
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    last_used = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        verbose_name = 'Token de notification push'
+        verbose_name_plural = 'Tokens de notification push'
+    
+    def __str__(self):
+        return f"{self.user.username} - {self.platform} - {self.token[:20]}..."
+
+
+# --- MODULE AGENDA : RENDEZ-VOUS ---
+class RendezVous(models.Model):
+    """Modèle pour gérer les rendez-vous individuels"""
+    STATUT_CHOICES = [
+        ('prevu', 'Prévu'),
+        ('en_cours', 'En cours'),
+        ('effectue', 'Effectué'),
+        ('annule', 'Annulé'),
+    ]
+    
+    TYPE_VISITEUR_CHOICES = [
+        ('ministere', 'Ministère'),
+        ('entreprise', 'Entreprise'),
+        ('particulier', 'Particulier'),
+    ]
+    
+    # Informations principales
+    objet = models.TextField(help_text="Objet du rendez-vous", blank=True, null=True, default="")
+    
+    # Dates et lieu
+    date_debut = models.DateTimeField(help_text="Début prévu")
+    date_fin = models.DateTimeField(help_text="Fin prévue")
+    lieu = models.CharField(max_length=255, blank=True, null=True, help_text="Salle ou bureau concerné")
+    
+    # Organisateur
+    organisateur = models.ForeignKey(
+        User, 
+        on_delete=models.CASCADE, 
+        related_name='rendezvous_organises',
+        help_text="Directeur ou responsable"
+    )
+    # Responsable (directeur/sous-directeur/chef de service/supérieur)
+    responsable = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='rendezvous_assignes'
+    )
+    
+    # Informations visiteur
+    visiteur_nom = models.CharField(max_length=255, help_text="Nom du visiteur", blank=True, null=True)
+    visiteur_prenoms = models.CharField(max_length=255, help_text="Prénoms du visiteur", blank=True, null=True)
+    visiteur_fonction = models.CharField(max_length=255, blank=True, null=True, help_text="Fonction du visiteur")
+    visiteur_telephone = models.CharField(max_length=50, blank=True, null=True, help_text="Téléphone du visiteur")
+    visiteur_type = models.CharField(
+        max_length=20,
+        choices=TYPE_VISITEUR_CHOICES,
+        help_text="Type de visiteur",
+        blank=True,
+        null=True
+    )
+    visiteur_structure = models.CharField(
+        max_length=255, 
+        blank=True, 
+        null=True, 
+        help_text="Nom du ministère/entreprise ou autre précision"
+    )
+    
+    # Statut
+    statut = models.CharField(max_length=20, choices=STATUT_CHOICES, default='prevu')
+    
+    # Audit trail
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        verbose_name = 'Rendez-vous'
+        verbose_name_plural = 'Rendez-vous'
+        ordering = ['-date_debut']
+    
+    def __str__(self):
+        return f"{self.visiteur_nom} {self.visiteur_prenoms} - {self.date_debut.strftime('%d/%m/%Y %H:%M')}"
+
+
+class RendezVousDocument(models.Model):
+    """Documents associés à un rendez-vous"""
+    rendezvous = models.ForeignKey(
+        RendezVous, 
+        on_delete=models.CASCADE, 
+        related_name='documents'
+    )
+    fichier = models.FileField(upload_to='rendezvous_documents/')
+    nom = models.CharField(max_length=255)
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+    uploaded_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
+    
+    class Meta:
+        verbose_name = 'Document de rendez-vous'
+        verbose_name_plural = 'Documents de rendez-vous'
+    
+    def __str__(self):
+        return f"{self.nom} - {self.rendezvous.titre}"
+
+
+# --- MODULE AGENDA : RÉUNIONS ---
+class Reunion(models.Model):
+    """Modèle pour gérer les réunions de service ou interdirections"""
+    TYPE_REUNION_CHOICES = [
+        ('presentiel', 'Présentiel'),
+        ('en_ligne', 'En ligne'),
+        ('mixte', 'Mixte'),
+    ]
+    
+    STATUT_CHOICES = [
+        ('prevu', 'Prévu'),
+        ('en_cours', 'En cours'),
+        ('termine', 'Terminé'),
+        ('annule', 'Annulé'),
+    ]
+    
+    # Informations principales
+    intitule = models.CharField(max_length=255, help_text="Nom de la réunion")
+    description = models.TextField(blank=True, null=True, help_text="Ordre du jour")
+    
+    # Type et dates
+    type_reunion = models.CharField(max_length=20, choices=TYPE_REUNION_CHOICES, default='presentiel')
+    date_debut = models.DateTimeField(help_text="Début de la réunion")
+    date_fin = models.DateTimeField(help_text="Fin de la réunion")
+    
+    # Lieu
+    lieu = models.CharField(max_length=255, blank=True, null=True, help_text="Salle / lien Zoom")
+    lien_zoom = models.URLField(blank=True, null=True, help_text="Créé via API Zoom")
+    
+    # Organisateur et participants
+    organisateur = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='agenda_reunions_organisees',
+        help_text="Directeur ou sous-directeur"
+    )
+    participants = models.ManyToManyField(
+        User, 
+        related_name='reunions_participant',
+        blank=True,
+        help_text="Liste des agents invités"
+    )
+    
+    # Statut
+    statut = models.CharField(max_length=20, choices=STATUT_CHOICES, default='prevu')
+    
+    # Compte rendu
+    compte_rendu = models.TextField(blank=True, null=True, help_text="Résumé de la réunion")
+    pv_fichier = models.FileField(
+        upload_to='reunions_pv/', 
+        blank=True, 
+        null=True,
+        help_text="Procès-verbal uploadé"
+    )
+    
+    # Audit trail
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        verbose_name = 'Réunion'
+        verbose_name_plural = 'Réunions'
+        ordering = ['-date_debut']
+    
+    def __str__(self):
+        return f"{self.intitule} - {self.date_debut.strftime('%d/%m/%Y %H:%M')}"
+
+
+class ReunionPresence(models.Model):
+    """Suivi de la présence aux réunions"""
+    reunion = models.ForeignKey(
+        Reunion, 
+        on_delete=models.CASCADE, 
+        related_name='presences'
+    )
+    participant = models.ForeignKey(User, on_delete=models.CASCADE)
+    present = models.BooleanField(default=False)
+    heure_arrivee = models.TimeField(blank=True, null=True)
+    commentaire = models.TextField(blank=True, null=True)
+    
+    class Meta:
+        verbose_name = 'Présence à une réunion'
+        verbose_name_plural = 'Présences aux réunions'
+        unique_together = ['reunion', 'participant']
+    
+    def __str__(self):
+        return f"{self.participant.username} - {self.reunion.intitule} ({'Présent' if self.present else 'Absent'})"
+
+
+# ============================================================
+# MODULE GED — GESTION ÉLECTRONIQUE DES DOCUMENTS & ARCHIVAGE
+# ============================================================
+
+import hashlib
+import uuid
+
+
+from django.contrib.contenttypes.fields import GenericForeignKey
+from django.contrib.contenttypes.models import ContentType
+
+
+class CategorieDocument(models.Model):
+    nom = models.CharField(max_length=100)
+    description = models.TextField(blank=True, null=True)
+    icone = models.CharField(max_length=50, blank=True, null=True)
+    parent = models.ForeignKey(
+        'self', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='sous_categories'
+    )
+    duree_conservation_ans = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text="Durée légale de conservation en années (ex: 10)"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'Catégorie de document'
+        verbose_name_plural = 'Catégories de documents'
+        ordering = ['nom']
+
+    def __str__(self):
+        return self.nom
+
+
+class Document(models.Model):
+    STATUT_CHOICES = [
+        ('brouillon', 'Brouillon'),
+        ('en_validation', 'En validation'),
+        ('valide', 'Validé'),
+        ('signe', 'Signé'),
+        ('diffuse', 'Diffusé'),
+        ('archive', 'Archivé'),
+    ]
+    CONFIDENTIALITE_CHOICES = [
+        ('public', 'Public'),
+        ('interne', 'Interne'),
+        ('confidentiel', 'Confidentiel'),
+    ]
+    TYPE_FICHIER_CHOICES = [
+        ('pdf', 'PDF'),
+        ('word', 'Word'),
+        ('excel', 'Excel'),
+        ('image', 'Image'),
+        ('scan', 'Scan'),
+        ('autre', 'Autre'),
+    ]
+
+    reference = models.CharField(max_length=100, unique=True, blank=True)
+    titre = models.CharField(max_length=500)
+    description = models.TextField(blank=True, null=True)
+    categorie = models.ForeignKey(
+        CategorieDocument, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='documents'
+    )
+
+    # Fichier
+    fichier = models.FileField(upload_to='ged/documents/%Y/%m/')
+    type_fichier = models.CharField(max_length=20, choices=TYPE_FICHIER_CHOICES, default='pdf')
+    taille_fichier = models.BigIntegerField(default=0, help_text="Taille en octets")
+    nom_fichier_original = models.CharField(max_length=255, blank=True)
+
+    # Métadonnées
+    statut = models.CharField(max_length=20, choices=STATUT_CHOICES, default='brouillon')
+    confidentialite = models.CharField(max_length=20, choices=CONFIDENTIALITE_CHOICES, default='interne')
+    mots_cles = models.TextField(blank=True, null=True, help_text="Mots-clés séparés par des virgules")
+    contenu_ocr = models.TextField(blank=True, null=True, help_text="Texte extrait par OCR")
+
+    # Auteur et service
+    auteur = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True,
+        related_name='ged_documents_crees'
+    )
+    service = models.ForeignKey(
+        'Service', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='ged_documents'
+    )
+
+    # Dates
+    date_document = models.DateField(null=True, blank=True)
+    date_expiration = models.DateField(null=True, blank=True)
+
+    # Versioning
+    version = models.PositiveIntegerField(default=1)
+    est_version_courante = models.BooleanField(default=True)
+    document_original = models.ForeignKey(
+        'self', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='versions_precedentes'
+    )
+
+    # Liens avec autres modules
+    courrier = models.ForeignKey(
+        'Courrier', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='ged_documents'
+    )
+    diligence = models.ForeignKey(
+        'Diligence', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='ged_documents'
+    )
+    reunion = models.ForeignKey(
+        'Reunion', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='ged_documents'
+    )
+    tache = models.ForeignKey(
+        'Tache', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='ged_documents'
+    )
+    # Rattachement générique à n'importe quel enregistrement métier (bien
+    # patrimonial, pièce comptable, facture, dossier juridique, échantillon
+    # labo...) en plus des FK historiques ci-dessus — pour que la GED couvre
+    # toutes les données électroniques du système, pas seulement courrier/
+    # diligence/réunion/tâche.
+    content_type = models.ForeignKey(
+        ContentType, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='ged_documents'
+    )
+    object_id = models.PositiveIntegerField(null=True, blank=True)
+    content_object = GenericForeignKey('content_type', 'object_id')
+
+    # Corbeille (suppression douce)
+    est_supprime = models.BooleanField(default=False)
+    supprime_le = models.DateTimeField(null=True, blank=True)
+    supprime_par = models.ForeignKey(
+        User, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='ged_documents_supprimes'
+    )
+
+    # Archivage
+    archive_le = models.DateTimeField(null=True, blank=True)
+    archive_par = models.ForeignKey(
+        User, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='ged_documents_archives'
+    )
+    duree_conservation_ans = models.PositiveIntegerField(null=True, blank=True)
+    date_destruction_prevue = models.DateField(null=True, blank=True)
+
+    # Intégrité
+    hash_sha256 = models.CharField(max_length=64, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Document GED'
+        verbose_name_plural = 'Documents GED'
+        ordering = ['-created_at']
+        indexes = [models.Index(fields=['content_type', 'object_id'])]
+
+    def __str__(self):
+        return f"{self.reference} — {self.titre}"
+
+    def save(self, *args, **kwargs):
+        # Génère la référence automatiquement
+        if not self.reference:
+            from django.utils import timezone
+            year = timezone.now().year
+            count = Document.objects.filter(created_at__year=year).count() + 1
+            self.reference = f"GED-{year}-{count:05d}"
+        # Calcule le hash SHA256 et la taille à la création
+        if self.fichier and not self.hash_sha256:
+            try:
+                self.fichier.seek(0)
+                sha256 = hashlib.sha256()
+                for chunk in iter(lambda: self.fichier.read(8192), b''):
+                    sha256.update(chunk)
+                self.hash_sha256 = sha256.hexdigest()
+                self.fichier.seek(0)
+                self.taille_fichier = self.fichier.size
+                self.nom_fichier_original = self.fichier.name
+            except Exception:
+                pass
+        super().save(*args, **kwargs)
+
+
+class DocumentVersion(models.Model):
+    """Historique des versions d'un document."""
+    document = models.ForeignKey(
+        Document, on_delete=models.CASCADE, related_name='historique_versions'
+    )
+    numero_version = models.PositiveIntegerField()
+    fichier = models.FileField(upload_to='ged/versions/%Y/%m/')
+    nom_fichier_original = models.CharField(max_length=255, blank=True)
+    hash_sha256 = models.CharField(max_length=64, blank=True)
+    taille_fichier = models.BigIntegerField(default=0)
+    auteur = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
+    commentaire = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'Version de document'
+        verbose_name_plural = 'Versions de documents'
+        ordering = ['-numero_version']
+        unique_together = ['document', 'numero_version']
+
+    def __str__(self):
+        return f"{self.document.reference} v{self.numero_version}"
+
+    def save(self, *args, **kwargs):
+        if self.fichier and not self.hash_sha256:
+            try:
+                self.fichier.seek(0)
+                sha256 = hashlib.sha256()
+                for chunk in iter(lambda: self.fichier.read(8192), b''):
+                    sha256.update(chunk)
+                self.hash_sha256 = sha256.hexdigest()
+                self.fichier.seek(0)
+                self.taille_fichier = self.fichier.size
+                self.nom_fichier_original = self.fichier.name
+            except Exception:
+                pass
+        super().save(*args, **kwargs)
+
+
+class DocumentAccess(models.Model):
+    DROIT_CHOICES = [
+        ('lecture', 'Lecture'),
+        ('modification', 'Modification'),
+        ('validation', 'Validation'),
+        ('archivage', 'Archivage'),
+    ]
+    document = models.ForeignKey(
+        Document, on_delete=models.CASCADE, related_name='acces'
+    )
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name='ged_acces'
+    )
+    droit = models.CharField(max_length=20, choices=DROIT_CHOICES, default='lecture')
+    accorde_par = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True,
+        related_name='ged_acces_accordes'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'Accès document'
+        verbose_name_plural = 'Accès documents'
+        unique_together = ['document', 'user', 'droit']
+
+    def __str__(self):
+        return f"{self.user.username} — {self.document.reference} ({self.droit})"
+
+
+class DocumentLog(models.Model):
+    ACTION_CHOICES = [
+        ('creation', 'Création'),
+        ('modification', 'Modification'),
+        ('consultation', 'Consultation'),
+        ('telechargement', 'Téléchargement'),
+        ('validation', 'Validation'),
+        ('archivage', 'Archivage'),
+        ('nouvelle_version', 'Nouvelle version'),
+        ('acces_refuse', 'Accès refusé'),
+        ('suppression', 'Envoyé à la corbeille'),
+        ('restauration', 'Restauré depuis la corbeille'),
+        ('partage_cree', 'Lien de partage créé'),
+        ('partage_revoque', 'Lien de partage révoqué'),
+        ('partage_consulte', 'Consulté via lien de partage'),
+        ('partage_telecharge', 'Téléchargé via lien de partage'),
+        ('destruction_demandee', 'Destruction demandée'),
+        ('destruction_approuvee', 'Destruction approuvée'),
+        ('destruction_rejetee', 'Destruction rejetée'),
+        ('extraction_texte', 'Texte extrait (recherche)'),
+    ]
+    document = models.ForeignKey(
+        Document, on_delete=models.CASCADE, related_name='logs'
+    )
+    utilisateur = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
+    action = models.CharField(max_length=25, choices=ACTION_CHOICES)
+    details = models.TextField(blank=True, null=True)
+    adresse_ip = models.GenericIPAddressField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'Journal document'
+        verbose_name_plural = 'Journal documents'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.action} — {self.document.reference} par {self.utilisateur}"
+
+
+class CertificatArchivage(models.Model):
+    """Certificat d'intégrité généré lors de l'archivage légal."""
+    document = models.OneToOneField(
+        Document, on_delete=models.CASCADE, related_name='certificat_archivage'
+    )
+    numero_certificat = models.CharField(max_length=50, unique=True)
+    hash_sha256 = models.CharField(max_length=64)
+    horodatage = models.DateTimeField(auto_now_add=True)
+    auteur = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, related_name='certificats_emis'
+    )
+    valide = models.BooleanField(default=True)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        verbose_name = 'Certificat d\'archivage'
+        verbose_name_plural = 'Certificats d\'archivage'
+
+    def __str__(self):
+        return f"Certificat {self.numero_certificat} — {self.document.reference}"
+
+
+class DocumentShareLink(models.Model):
+    """Lien de partage public temporaire vers un document (sans compte),
+    optionnellement protégé par mot de passe et/ou expirant."""
+    document = models.ForeignKey(Document, on_delete=models.CASCADE, related_name='liens_partage')
+    token = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    cree_par = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='ged_liens_crees')
+    expire_le = models.DateTimeField(null=True, blank=True)
+    mot_de_passe_hash = models.CharField(max_length=255, blank=True)
+    nombre_acces = models.PositiveIntegerField(default=0)
+    actif = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'Lien de partage document'
+        verbose_name_plural = 'Liens de partage documents'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Partage {self.document.reference} ({self.token})"
+
+    @property
+    def est_expire(self):
+        return bool(self.expire_le and self.expire_le < timezone.now())
+
+
+class DemandeDestruction(models.Model):
+    """Demande de destruction définitive d'un document archivé, soumise à
+    approbation (Service Information & Documentation / DG / Admin) avant
+    exécution — cf. cycle de rétention légale (durée de conservation)."""
+    STATUT_CHOICES = [
+        ('EN_ATTENTE', 'En attente'),
+        ('APPROUVEE', 'Approuvée'),
+        ('REJETEE', 'Rejetée'),
+        ('EXECUTEE', 'Exécutée'),
+    ]
+    document = models.ForeignKey(Document, on_delete=models.CASCADE, related_name='demandes_destruction')
+    demande_par = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, related_name='ged_destructions_demandees'
+    )
+    motif = models.TextField(blank=True)
+    statut = models.CharField(max_length=20, choices=STATUT_CHOICES, default='EN_ATTENTE')
+    decide_par = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, related_name='ged_destructions_decidees'
+    )
+    motif_decision = models.TextField(blank=True)
+    date_demande = models.DateTimeField(auto_now_add=True)
+    date_decision = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        verbose_name = 'Demande de destruction'
+        verbose_name_plural = 'Demandes de destruction'
+        ordering = ['-date_demande']
+
+    def __str__(self):
+        return f"Destruction {self.document.reference} ({self.statut})"
+
+
+# ============================================================
+# MODULE RH — Gestion du Personnel
+# ============================================================
+
+class FicheAgent(models.Model):
+    STATUT_CHOICES = [
+        ('actif', 'Actif'),
+        ('suspendu', 'Suspendu'),
+        ('retraite', 'Retraité'),
+        ('demissionnaire', 'Démissionnaire'),
+    ]
+    SITUATION_CHOICES = [
+        ('celibataire', 'Célibataire'),
+        ('marie', 'Marié(e)'),
+        ('divorce', 'Divorcé(e)'),
+        ('veuf', 'Veuf/Veuve'),
+    ]
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='fiche_agent', null=True, blank=True)
+    matricule = models.CharField(max_length=50, unique=True)
+    nom = models.CharField(max_length=100)
+    prenoms = models.CharField(max_length=200)
+    photo = models.ImageField(upload_to='rh/agents/photos/', null=True, blank=True)
+    grade = models.CharField(max_length=100, blank=True)
+    emploi = models.CharField(max_length=200, blank=True)
+    fonction = models.CharField(max_length=200, blank=True)
+    direction = models.ForeignKey('Direction', on_delete=models.SET_NULL, null=True, blank=True, related_name='fiches_agents')
+    service = models.ForeignKey('Service', on_delete=models.SET_NULL, null=True, blank=True, related_name='fiches_agents')
+    sous_direction = models.ForeignKey('SousDirection', on_delete=models.SET_NULL, null=True, blank=True, related_name='fiches_agents')
+    date_prise_service = models.DateField(null=True, blank=True)
+    date_naissance = models.DateField(null=True, blank=True)
+    lieu_naissance = models.CharField(max_length=200, blank=True)
+    situation_matrimoniale = models.CharField(max_length=20, choices=SITUATION_CHOICES, default='celibataire')
+    nombre_enfants = models.PositiveIntegerField(default=0)
+    telephone = models.CharField(max_length=20, blank=True)
+    email_professionnel = models.EmailField(blank=True)
+    adresse = models.TextField(blank=True)
+    statut = models.CharField(max_length=20, choices=STATUT_CHOICES, default='actif')
+    date_depart = models.DateField(null=True, blank=True, help_text="Date de depart de l'agent (demission, retraite, fin de contrat)")
+    motif_depart = models.CharField(max_length=255, blank=True)
+    contact_urgence_nom = models.CharField(max_length=200, blank=True)
+    contact_urgence_tel = models.CharField(max_length=20, blank=True)
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Fiche Agent'
+        ordering = ['nom', 'prenoms']
+
+    def __str__(self):
+        return f"{self.matricule} - {self.nom} {self.prenoms}"
+
+
+class MissionRH(models.Model):
+    STATUT_CHOICES = [
+        ('demande', 'Demande'),
+        ('validee', 'Validée'),
+        ('rejetee', 'Rejetée'),
+        ('en_cours', 'En cours'),
+        ('terminee', 'Terminée'),
+        ('archivee', 'Archivée'),
+    ]
+    agent = models.ForeignKey(User, on_delete=models.CASCADE, related_name='missions_rh')
+    objet = models.CharField(max_length=500)
+    destination = models.CharField(max_length=500)
+    date_debut = models.DateField()
+    date_fin = models.DateField()
+    vehicule = models.BooleanField(default=False)
+    type_vehicule = models.CharField(max_length=100, blank=True)
+    frais_alloues = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    ordre_mission_num = models.CharField(max_length=100, blank=True)
+    statut = models.CharField(max_length=20, choices=STATUT_CHOICES, default='demande')
+    valideur = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='missions_rh_validees')
+    date_validation = models.DateTimeField(null=True, blank=True)
+    motif_rejet = models.TextField(blank=True)
+    rapport = models.TextField(blank=True)
+    rapport_fichier = models.FileField(upload_to='rh/missions/rapports/', null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Mission RH'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Mission {self.agent} → {self.destination}"
+
+
+class EvaluationRH(models.Model):
+    MENTION_CHOICES = [
+        ('excellent', 'Excellent'),
+        ('tres_bien', 'Très Bien'),
+        ('bien', 'Bien'),
+        ('satisfaisant', 'Satisfaisant'),
+        ('insuffisant', 'Insuffisant'),
+    ]
+    agent = models.ForeignKey(User, on_delete=models.CASCADE, related_name='evaluations_rh')
+    evaluateur = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='evaluations_rh_faites')
+    annee = models.PositiveIntegerField()
+    periode = models.CharField(max_length=50, blank=True, default='Annuelle')
+    note_globale = models.FloatField(default=0)
+    mention = models.CharField(max_length=20, choices=MENTION_CHOICES, blank=True)
+    ponctualite = models.FloatField(default=0)
+    assiduite = models.FloatField(default=0)
+    competence = models.FloatField(default=0)
+    initiative = models.FloatField(default=0)
+    travail_equipe = models.FloatField(default=0)
+    rendement = models.FloatField(default=0)
+    appreciation = models.TextField(blank=True)
+    objectifs_atteints = models.TextField(blank=True)
+    objectifs_prochaine_periode = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'Évaluation RH'
+        ordering = ['-annee']
+
+    def __str__(self):
+        return f"Éval {self.agent} — {self.annee}"
+
+
+class FormationRH(models.Model):
+    STATUT_CHOICES = [
+        ('planifiee', 'Planifiée'),
+        ('en_cours', 'En cours'),
+        ('terminee', 'Terminée'),
+        ('annulee', 'Annulée'),
+    ]
+    titre = models.CharField(max_length=500)
+    description = models.TextField(blank=True)
+    organisateur = models.CharField(max_length=500, blank=True)
+    lieu = models.CharField(max_length=500, blank=True)
+    date_debut = models.DateField()
+    date_fin = models.DateField()
+    duree_heures = models.PositiveIntegerField(default=0)
+    statut = models.CharField(max_length=20, choices=STATUT_CHOICES, default='planifiee')
+    places_disponibles = models.PositiveIntegerField(null=True, blank=True)
+    cout = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='formations_rh_creees')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'Formation RH'
+        ordering = ['-date_debut']
+
+    def __str__(self):
+        return self.titre
+
+
+class InscriptionFormationRH(models.Model):
+    STATUT_CHOICES = [
+        ('inscrit', 'Inscrit'),
+        ('present', 'Présent'),
+        ('absent', 'Absent'),
+        ('certifie', 'Certifié'),
+    ]
+    formation = models.ForeignKey(FormationRH, on_delete=models.CASCADE, related_name='inscriptions')
+    agent = models.ForeignKey(User, on_delete=models.CASCADE, related_name='inscriptions_formations_rh')
+    statut = models.CharField(max_length=20, choices=STATUT_CHOICES, default='inscrit')
+    attestation = models.FileField(upload_to='rh/formations/attestations/', null=True, blank=True)
+    note = models.FloatField(null=True, blank=True)
+    observations = models.TextField(blank=True)
+    date_inscription = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ['formation', 'agent']
+
+    def __str__(self):
+        return f"{self.agent} → {self.formation}"
+
+
+class DocumentRH(models.Model):
+    TYPE_CHOICES = [
+        ('arrete', 'Arrêté'),
+        ('decision', 'Décision'),
+        ('affectation', 'Affectation'),
+        ('promotion', 'Promotion'),
+        ('sanction', 'Sanction'),
+        ('acte', 'Acte administratif'),
+        ('contrat', 'Contrat'),
+        ('diplome', 'Diplôme'),
+        ('autre', 'Autre'),
+    ]
+    agent = models.ForeignKey(User, on_delete=models.CASCADE, related_name='documents_rh')
+    type_document = models.CharField(max_length=20, choices=TYPE_CHOICES)
+    titre = models.CharField(max_length=500)
+    reference = models.CharField(max_length=200, blank=True)
+    date_document = models.DateField()
+    fichier = models.FileField(upload_to='rh/documents/', null=True, blank=True)
+    description = models.TextField(blank=True)
+    signataire = models.CharField(max_length=200, blank=True)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='documents_rh_crees')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'Document RH'
+        ordering = ['-date_document']
+
+    def __str__(self):
+        return f"{self.get_type_document_display()} — {self.titre}"
+
+
+class DemandeAttestation(models.Model):
+    TYPE_CHOICES = [
+        ('travail', 'Attestation de travail'),
+        ('presence', 'Attestation de présence'),
+    ]
+    STATUT_CHOICES = [
+        ('en_attente', 'En attente'),
+        ('en_cours', 'En cours de traitement'),
+        ('traitee', 'Traitée'),
+        ('terminee', 'Terminée'),
+        ('rejetee', 'Rejetée'),
+        ('annulee', 'Annulée'),
+    ]
+    agent = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name='demandes_attestations'
+    )
+    responsable_rh = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='attestations_traitees'
+    )
+    type_attestation = models.CharField(max_length=20, choices=TYPE_CHOICES)
+    motif = models.TextField(blank=True)
+    nombre_copies = models.PositiveIntegerField(default=1)
+    commentaire_agent = models.TextField(blank=True)
+    date_souhaitee = models.DateField(null=True, blank=True)
+    statut = models.CharField(max_length=20, choices=STATUT_CHOICES, default='en_attente')
+    commentaire_rh = models.TextField(blank=True)
+    numero_attestation = models.CharField(max_length=50, unique=True, blank=True, null=True)
+    pdf_file = models.FileField(upload_to='attestations/', null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = "Demande d'attestation"
+        verbose_name_plural = "Demandes d'attestation"
+
+    def __str__(self):
+        return f"{self.get_type_attestation_display()} - {self.agent.username} - {self.statut}"
+
+    def generer_numero(self):
+        if not self.numero_attestation and self.pk:
+            self.numero_attestation = f"ATT-{self.created_at.year}-{self.pk:06d}"
+            type(self).objects.filter(pk=self.pk).update(numero_attestation=self.numero_attestation)
+
+
+class SitePalier(models.Model):
+    """Palier (étage/niveau) d'un site — chaque palier peut avoir ses propres coordonnées GPS."""
+    site = models.ForeignKey(
+        Site, on_delete=models.CASCADE, related_name='paliers'
+    )
+    nom = models.CharField(max_length=100, help_text="Ex: Rez-de-chaussée, 3ème étage, Bâtiment B")
+    description = models.CharField(max_length=255, blank=True)
+    latitude = models.DecimalField(max_digits=10, decimal_places=8, null=True, blank=True)
+    longitude = models.DecimalField(max_digits=11, decimal_places=8, null=True, blank=True)
+    rayon_pointage = models.IntegerField(default=200, help_text='Rayon en mètres pour le pointage GPS')
+    est_actif = models.BooleanField(default=True)
+    ordre = models.PositiveSmallIntegerField(default=0, help_text='Ordre d\'affichage')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'Palier de site'
+        verbose_name_plural = 'Paliers de site'
+        ordering = ['ordre', 'nom']
+
+    def __str__(self):
+        return f"{self.site.nom} — {self.nom}"
