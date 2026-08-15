@@ -23,6 +23,7 @@ DIRECTION_CODE_MAP = {
     "Direction de l'Aéronautique": 'DAE',
     "Direction de la Métrologie et des Contrôles Techniques": 'DMCT',
     "Direction de la Formation, de l'Innovation et de la Recherche": 'DFIR',
+    "Direction des Essais et Analyses de Laboratoire": 'DEAL',
     # Services rattachés à la Direction Générale — modélisés comme des
     # Direction (même mécanisme d'accès) même s'il ne s'agit pas de
     # directions à part entière dans l'organigramme administratif.

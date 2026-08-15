@@ -17,7 +17,7 @@ from rest_framework.authentication import TokenAuthentication
 # donner accès aux portails de direction (DAE/DMCT/DFIR) après fusion de compte.
 # Source unique de vérité : core/direction_access.py (aussi utilisé par les
 # permissions DRF des apps DAE/DMCT pour le contrôle d'accès côté backend).
-from core.direction_access import DIRECTION_CODE_MAP, dynamic_module_permissions_for
+from core.direction_access import DIRECTION_CODE_MAP, dynamic_module_permissions_for, user_tier, is_full_access_user
 from django.contrib.auth.models import User
 from django.db.models import Q, Count, Prefetch
 from django.db import models
@@ -353,6 +353,21 @@ class UserProfileView(APIView):
             # bascule entre les deux portails sans reconnexion.
             other_access = None
             client_profile = getattr(user, 'client_profile', None)
+            if client_profile is None:
+                # Accès auto au portail labo /app, sans liaison manuelle de compte,
+                # pour : le personnel de la Direction des Essais et Analyses de
+                # Laboratoire (DEAL), et tout compte "accès total" (ADMIN ou
+                # rattaché à la Direction Générale) — même règle que le reste de
+                # l'app (is_full_access_user contourne déjà tous les autres
+                # cloisonnements par direction). Rôle labo dérivé du palier
+                # e-diligence (Directeur/Admin -> ADMIN labo, sinon -> GESTIONNAIRE).
+                is_deal = profile.direction_id and DIRECTION_CODE_MAP.get(profile.direction.nom) == 'DEAL'
+                if is_deal or is_full_access_user(user):
+                    from clients.models import ClientProfile
+                    labo_role = 'ADMIN' if (is_full_access_user(user) or user_tier(user) == 'direction') else 'GESTIONNAIRE'
+                    client_profile, _ = ClientProfile.objects.get_or_create(
+                        user=user, defaults={'role': labo_role}
+                    )
             if client_profile is not None:
                 other_access = {
                     'account_type': 'labo',
