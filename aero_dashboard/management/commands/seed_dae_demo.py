@@ -547,6 +547,7 @@ class Command(BaseCommand):
                     reference=f"DEV-DAE-{annee}-{devis_seq:05d}", client=client,
                     description="Devis pour intervention de maintenance",
                     montant_main_oeuvre=mo, montant_pieces=pi, frais_supplementaires=frais,
+                    taux_tva=Decimal("18"),
                     statut=random.choice(["BROUILLON", "ENVOYE", "ACCEPTE", "REFUSE"]),
                     date_validite=jours_avant(-30),
                 )
@@ -566,6 +567,7 @@ class Command(BaseCommand):
             facture = FactureDAE(
                 reference=f"FACT-DAE-{annee}-{facture_seq:05d}", ordre_travail=ot, client=ot.aeronef.client,
                 montant_main_oeuvre=mo, montant_pieces=pi, frais_supplementaires=frais,
+                taux_tva=Decimal("18"),
                 statut=random.choices(["EMISE", "PAYEE", "IMPAYEE"], weights=[3, 5, 2])[0],
             )
             facture.recalculer_totaux()
