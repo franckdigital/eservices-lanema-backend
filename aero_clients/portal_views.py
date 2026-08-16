@@ -169,12 +169,20 @@ class ClientPortalDashboardView(APIView):
         })
 
 
-class ClientPortalAeronefViewSet(viewsets.ReadOnlyModelViewSet):
+class ClientPortalAeronefViewSet(viewsets.ModelViewSet):
+    """Le client peut consulter et déclarer ses propres aéronefs — cf. cahier
+    des charges section 3.7 (le dépôt d'une demande suppose de pouvoir
+    identifier l'aéronef concerné, y compris pour un tout nouveau client)."""
+
     serializer_class = ClientPortalAeronefSerializer
     permission_classes = [IsClientPortalUser]
+    http_method_names = ["get", "post", "head", "options"]
 
     def get_queryset(self):
         return Aeronef.objects.filter(client=get_client_aeronautique(self.request.user))
+
+    def perform_create(self, serializer):
+        serializer.save(client=get_client_aeronautique(self.request.user))
 
 
 class ClientPortalDemandeViewSet(viewsets.ModelViewSet):

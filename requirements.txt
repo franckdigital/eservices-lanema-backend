@@ -21,6 +21,10 @@ pytesseract>=0.3.10
 pdfplumber>=0.10.0
 # Extraction de texte GED (recherche plein texte) — pas de binaire externe requis
 PyMuPDF>=1.24.0
+# Reconnaissance faciale (pointage assisté DAE/RH) — auto-hébergé, aucune photo
+# envoyée à un tiers. dlib nécessite cmake + un compilateur C++ sur le serveur
+# (apt install -y cmake build-essential avant pip install si absent).
+face_recognition>=1.3.0
 # Optionnel pour l'admin amélioré
 # django-admin-interface
 # Pour les tests

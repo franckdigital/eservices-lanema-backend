@@ -489,7 +489,7 @@ class PresenceSerializer(serializers.ModelSerializer):
             'commentaire', 'created_at', 'updated_at',
             'fiche_agent', 'enregistre_par', 'enregistre_par_info', 'verification_method',
             'verification_photo_url', 'fiche_agent_photo_url', 'liveness_passed',
-            'liveness_method', 'reference_photo_absente',
+            'liveness_method', 'reference_photo_absente', 'face_match_distance',
         ]
         read_only_fields = ['id', 'agent', 'created_at', 'updated_at', 'localisation_valide']
 

@@ -1125,6 +1125,10 @@ class Presence(models.Model):
         default=False,
         help_text="Vrai si la FicheAgent n'avait pas de photo de reference au moment du pointage"
     )
+    face_match_distance = models.FloatField(
+        null=True, blank=True,
+        help_text="Distance faciale (face_recognition) entre la photo de reference et la photo capturee — plus bas = plus proche. Null si comparaison non effectuee (pas de photo de reference ou moteur indisponible)."
+    )
 
     # Pointage hors-ligne : identifiant genere cote mobile pour deduplication
     # idempotente lors de la resynchronisation, et horodatage reel de capture

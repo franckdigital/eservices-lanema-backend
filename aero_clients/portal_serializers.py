@@ -31,13 +31,17 @@ class ClientPortalRegisterSerializer(serializers.Serializer):
 
 
 class ClientPortalAeronefSerializer(serializers.ModelSerializer):
+    """Le client peut declarer ses propres aeronefs (identification uniquement)
+    — heures de vol/cycles/statut restent pilotes par la DAE au fil des
+    interventions, pas saisis par le client."""
+
     class Meta:
         model = Aeronef
         fields = [
             "id", "immatriculation", "type_aeronef", "constructeur", "modele", "numero_serie",
             "annee_fabrication", "nombre_heures_vol", "nombre_cycles", "statut",
         ]
-        read_only_fields = fields
+        read_only_fields = ["id", "nombre_heures_vol", "nombre_cycles", "statut"]
 
 
 class ClientPortalDemandeSerializer(serializers.ModelSerializer):

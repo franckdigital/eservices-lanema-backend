@@ -2080,6 +2080,29 @@ class ProxyPresenceView(APIView):
         except FicheAgent.DoesNotExist:
             return Response({'error': 'Fiche agent introuvable'}, status=status.HTTP_404_NOT_FOUND)
 
+        # Comparaison faciale automatique contre la photo de référence RH —
+        # c'est le vrai rempart contre un collègue qui pointerait à la place
+        # de l'agent avec n'importe quelle photo. Un souci côté photo de
+        # référence (absente/illisible/sans visage — pas la faute de l'agent)
+        # laisse passer le pointage en vérification manuelle, comme avant ;
+        # un souci côté photo capturée à l'instant, ou une identité qui ne
+        # correspond pas, bloque — l'agent/secrétaire peut reprendre la photo.
+        face_match_distance = None
+        if fiche_agent.photo:
+            from .face_match import compare_faces
+            match_result = compare_faces(fiche_agent.photo, verification_photo)
+            if match_result['stage'] == 'captured':
+                return Response(
+                    {'error': f"Vérification faciale impossible : {match_result['error']}. Reprenez la photo."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if match_result['stage'] is None and not match_result['matched']:
+                return Response(
+                    {'error': "Le visage sur la photo ne correspond pas à la photo de référence de cet agent. Pointage refusé."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            face_match_distance = match_result['distance']
+
         agent_obj = None
         if fiche_agent.user_id:
             agent_obj = Agent.objects.filter(user_id=fiche_agent.user_id).first()
@@ -2113,6 +2136,7 @@ class ProxyPresenceView(APIView):
                 'liveness_passed': liveness_passed,
                 'liveness_method': liveness_method,
                 'reference_photo_absente': not bool(fiche_agent.photo),
+                'face_match_distance': face_match_distance,
             },
         )
 
