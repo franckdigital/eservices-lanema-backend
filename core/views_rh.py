@@ -40,7 +40,16 @@ class FicheAgentViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         qs = super().get_queryset()
         site_id = _get_site_id(self.request)
-        if site_id:
+        # "Pointage Agents" (check-in assisté par le secrétariat/accueil) doit
+        # explicitement voir tous les agents, toutes directions et sites
+        # confondus — le filtre de site n'a pas lieu d'être pour cet usage.
+        # Réservé aux rôles déjà autorisés à effectuer un pointage assisté.
+        caller_role = getattr(getattr(self.request.user, 'profile', None), 'role', None)
+        bypass_site = (
+            self.request.query_params.get('include_all_sites') == 'true'
+            and caller_role in ('ADMIN', 'SECRETAIRE')
+        )
+        if site_id and not bypass_site:
             # Une FicheAgent sans compte utilisateur (agents sans smartphone,
             # jamais inscrits) n'a aucun moyen d'être rattachée à un site —
             # on ne les exclut donc pas du site-scoping, seulement les fiches

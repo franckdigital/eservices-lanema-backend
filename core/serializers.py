@@ -1,8 +1,11 @@
 import json
+import re
 from django.contrib.auth.models import User
 from django.contrib.auth import authenticate, get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
+from django.db.models import Value
+from django.db.models.functions import Replace
 from rest_framework import serializers
 from rest_framework.exceptions import AuthenticationFailed
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
@@ -57,15 +60,28 @@ class MyTokenObtainPairSerializer(TokenObtainPairSerializer):
             except User.DoesNotExist:
                 pass
                 
-        # 3. Recherche par téléphone
+        # 3. Recherche par téléphone — comparaison sur les chiffres uniquement.
+        # La numérotation ivoirienne conserve le 0 initial même en format
+        # international (+225 07 XX XX XX XX), donc les 10 derniers chiffres
+        # identifient le numéro qu'il soit saisi avec ou sans l'indicatif +225.
         if user is None:
-            try:
-                profile = UserProfile.objects.get(telephone=username.strip())
-                user_obj = profile.user
-                if user_obj.check_password(password):
-                    user = user_obj
-            except UserProfile.DoesNotExist:
-                pass
+            digits = re.sub(r'\D', '', username)
+            national_number = digits[-10:] if len(digits) >= 8 else None
+            if national_number:
+                try:
+                    profile = (
+                        UserProfile.objects
+                        .annotate(tel_digits=Replace(
+                            Replace(Replace('telephone', Value(' '), Value('')), Value('-'), Value('')),
+                            Value('+'), Value(''),
+                        ))
+                        .get(tel_digits__endswith=national_number)
+                    )
+                    user_obj = profile.user
+                    if user_obj.check_password(password):
+                        user = user_obj
+                except (UserProfile.DoesNotExist, UserProfile.MultipleObjectsReturned):
+                    pass
                 
         if user is None:
             raise AuthenticationFailed('Aucun utilisateur trouvé')
