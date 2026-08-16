@@ -23,6 +23,8 @@ PERMISSION_CATALOG = [
 
     ("facturation.view", "Voir la facturation", "Facturation"),
     ("facturation.manage", "Gerer la facturation", "Facturation"),
+    ("facturation.valider_paiement", "Valider un paiement recu", "Facturation"),
+    ("facturation.valider_responsable", "Signer en tant que responsable labo (devis/bon de commande/facture)", "Facturation"),
 
     ("qualite.view", "Voir la qualite", "Qualite"),
     ("qualite.manage", "Gerer la qualite", "Qualite"),
@@ -53,6 +55,7 @@ DEFAULT_ROLE_PERMISSIONS = {
         "essais.view", "essais.manage",
         "metrologie.view", "metrologie.manage",
         "facturation.view", "facturation.manage",
+        "facturation.valider_paiement", "facturation.valider_responsable",
         "qualite.view", "qualite.manage",
         "stock.view", "stock.manage",
         "reporting.view",
@@ -70,7 +73,28 @@ DEFAULT_ROLE_PERMISSIONS = {
         "dashboard.view",
         "clients.view",
         "facturation.view", "facturation.manage",
+        "facturation.valider_paiement",
         "reporting.view",
         "notifications.view",
     ],
 }
+
+
+def user_has_permission(user, code):
+    """Vrai si `user` (compte labo, clients.ClientProfile) a la permission
+    `code` accordee : role ADMIN toujours autorise, sinon lookup dans la
+    matrice LaboRolePermission (Administration > Permissions). Reutilisable
+    depuis n'importe quelle app (facturation, qualite...) sans dependance
+    circulaire, tant que l'import de LaboRolePermission reste local a la
+    fonction."""
+    from .models import LaboRolePermission
+
+    profile = getattr(user, "client_profile", None)
+    role = getattr(profile, "role", None)
+    if role is None:
+        return False
+    if role == "ADMIN":
+        return True
+    return LaboRolePermission.objects.filter(
+        role=role, permission_code=code, is_granted=True
+    ).exists()

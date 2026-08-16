@@ -11,6 +11,7 @@ from rest_framework.views import APIView
 
 from .models import BonCommande, Facture, Proforma, DemandeAnalyse
 from .serializers import BonCommandeSerializer, FactureSerializer, ProformaSerializer, DemandeAnalyseSerializer
+from clients.permissions_catalog import user_has_permission
 
 from io import BytesIO
 
@@ -113,7 +114,7 @@ class ProformaViewSet(viewsets.ModelViewSet):
         user = request.user
         profile = getattr(user, "client_profile", None)
 
-        if profile is None or getattr(profile, "role", None) not in {"ADMIN", "GESTIONNAIRE"}:
+        if not user_has_permission(user, "facturation.valider_responsable"):
             return Response({"detail": "Non autorisé"}, status=status.HTTP_403_FORBIDDEN)
         if not profile.signature_image or not profile.cachet_image:
             return Response(
@@ -404,7 +405,7 @@ class BonCommandeViewSet(viewsets.ModelViewSet):
         user = request.user
         profile = getattr(user, "client_profile", None)
 
-        if profile is None or getattr(profile, "role", None) not in {"ADMIN", "GESTIONNAIRE"}:
+        if not user_has_permission(user, "facturation.valider_responsable"):
             return Response({"detail": "Non autorisé"}, status=status.HTTP_403_FORBIDDEN)
         if not profile.signature_image or not profile.cachet_image:
             return Response(
@@ -566,11 +567,17 @@ class FactureViewSet(viewsets.ModelViewSet):
 
         facture = self.get_object()
 
-        # Le client doit d'abord se munir (signer) son bon de commande avant de
-        # pouvoir payer la facture correspondante.
+        # Le client doit d'abord signer son bon de commande, ET le responsable
+        # labo doit l'avoir validé (signature + cachet), avant de pouvoir payer
+        # la facture correspondante.
         if facture.bon_commande is None or facture.bon_commande.statut != "SIGNE_CLIENT":
             return Response(
                 {"detail": "Vous devez d'abord signer votre bon de commande avant de procéder au paiement."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not facture.bon_commande.signature_responsable_appliquee:
+            return Response(
+                {"detail": "Le bon de commande doit d'abord être validé par le responsable du laboratoire."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -616,7 +623,7 @@ class FactureViewSet(viewsets.ModelViewSet):
         user = request.user
         profile = getattr(user, "client_profile", None)
 
-        if profile is None or getattr(profile, "role", None) not in {"ADMIN", "GESTIONNAIRE"}:
+        if not user_has_permission(user, "facturation.valider_responsable"):
             return Response({"detail": "Non autorisé"}, status=status.HTTP_403_FORBIDDEN)
         if not profile.signature_image or not profile.cachet_image:
             return Response(
@@ -756,12 +763,16 @@ class FactureViewSet(viewsets.ModelViewSet):
 
         facture = self.get_object()
         user = request.user
-        role = getattr(getattr(user, "client_profile", None), "role", None)
 
-        if role not in {"ADMIN", "GESTIONNAIRE", "COMPTABLE"}:
+        if not user_has_permission(user, "facturation.valider_paiement"):
             return Response(
                 {"detail": "Non autorisé"},
                 status=status.HTTP_403_FORBIDDEN,
+            )
+        if facture.statut != "EN_ATTENTE_VALIDATION":
+            return Response(
+                {"detail": "Cette facture n'est pas en attente de validation de paiement."},
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         facture.paiement_valide = True
@@ -815,10 +826,19 @@ class FacturationStatsView(APIView):
         return Response(data)
 
 
+
 class DemandeAnalyseViewSet(viewsets.ModelViewSet):
-    queryset = DemandeAnalyse.objects.select_related("client", "demande_devis", "proforma").all()
+    queryset = DemandeAnalyse.objects.select_related("client", "demande_devis", "proforma", "facture").all()
     serializer_class = DemandeAnalyseSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        role = getattr(getattr(user, "client_profile", None), "role", None)
+        if role == "CLIENT":
+            return qs.filter(client=user)
+        return qs
 
     def perform_create(self, serializer):
         # Génération simple d'un numéro DA-00001
@@ -832,6 +852,20 @@ class DemandeAnalyseViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"], url_path="confirmer_depot_echantillons")
     def confirmer_depot_echantillons(self, request, pk=None):
         analyse = self.get_object()
+
+        if not user_has_permission(request.user, "echantillons.manage"):
+            return Response({"detail": "Non autorisé"}, status=status.HTTP_403_FORBIDDEN)
+        if analyse.facture is None or analyse.facture.statut != "PAYEE":
+            return Response(
+                {"detail": "Le paiement doit être validé avant la réception des échantillons."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if analyse.statut != "EN_ATTENTE_ECHANTILLONS":
+            return Response(
+                {"detail": "Cette demande n'est pas en attente de dépôt d'échantillons."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         analyse.statut = "ECHANTILLONS_RECUS"
         analyse.date_depot_echantillons = timezone.now().date()
         analyse.save(update_fields=["statut", "date_depot_echantillons"])
@@ -1020,6 +1054,15 @@ class DemandeAnalyseViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"], url_path="demarrer_analyse")
     def demarrer_analyse(self, request, pk=None):
         analyse = self.get_object()
+
+        if not user_has_permission(request.user, "essais.manage"):
+            return Response({"detail": "Non autorisé"}, status=status.HTTP_403_FORBIDDEN)
+        if analyse.statut != "ECHANTILLONS_RECUS":
+            return Response(
+                {"detail": "Les échantillons doivent être réceptionnés avant de démarrer l'analyse."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         analyse.statut = "EN_COURS"
         analyse.date_debut_analyse = timezone.now().date()
         analyse.save(update_fields=["statut", "date_debut_analyse"])
@@ -1038,6 +1081,15 @@ class DemandeAnalyseViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"], url_path="terminer_analyse")
     def terminer_analyse(self, request, pk=None):
         analyse = self.get_object()
+
+        if not user_has_permission(request.user, "essais.manage"):
+            return Response({"detail": "Non autorisé"}, status=status.HTTP_403_FORBIDDEN)
+        if analyse.statut != "EN_COURS":
+            return Response(
+                {"detail": "L'analyse doit être en cours avant de pouvoir être clôturée."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         observations = request.data.get("observations", "")
         analyse.statut = "TERMINEE"
         analyse.date_fin_analyse = timezone.now().date()

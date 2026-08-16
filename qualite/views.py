@@ -1,7 +1,8 @@
 from django.db.models import Count, F
 from django.utils import timezone
 
-from rest_framework import permissions, viewsets
+from rest_framework import permissions, status, viewsets
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -14,10 +15,11 @@ from .serializers import (
     NonConformiteSerializer,
     RecommandationAuditSerializer,
 )
+from clients.permissions_catalog import user_has_permission
 
 
 class EchantillonViewSet(viewsets.ModelViewSet):
-    queryset = Echantillon.objects.select_related('demande').all()
+    queryset = Echantillon.objects.select_related('demande', 'demande__facture').all()
     serializer_class = EchantillonSerializer
     permission_classes = [permissions.IsAuthenticated]
 
@@ -26,7 +28,31 @@ class EchantillonViewSet(viewsets.ModelViewSet):
         statut = self.request.query_params.get('statut')
         if statut and statut != 'TOUS':
             queryset = queryset.filter(statut=statut)
+        role = getattr(getattr(self.request.user, "client_profile", None), "role", None)
+        if role == "CLIENT":
+            queryset = queryset.filter(demande__client=self.request.user)
         return queryset
+
+    def _check_labo_staff(self):
+        if not user_has_permission(self.request.user, "echantillons.manage"):
+            raise PermissionDenied("Seul le personnel du laboratoire peut gérer les échantillons.")
+
+    def perform_create(self, serializer):
+        self._check_labo_staff()
+        demande = serializer.validated_data.get("demande")
+        if demande is not None and (demande.facture is None or demande.facture.statut != "PAYEE"):
+            raise ValidationError(
+                {"detail": "Le paiement doit être validé avant la réception des échantillons."}
+            )
+        serializer.save()
+
+    def perform_update(self, serializer):
+        self._check_labo_staff()
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        self._check_labo_staff()
+        instance.delete()
 
 
 class NonConformiteViewSet(viewsets.ModelViewSet):
