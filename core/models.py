@@ -1063,7 +1063,7 @@ class Presence(models.Model):
         ('permission accordée', 'Permission accordée'),
     ]
     # id: UUID ou BigAutoField (par défaut)
-    agent = models.ForeignKey('Agent', on_delete=models.CASCADE, related_name='presences')
+    agent = models.ForeignKey('Agent', on_delete=models.CASCADE, related_name='presences', null=True, blank=True)
     date_presence = models.DateField()
     heure_arrivee = models.TimeField(null=True, blank=True)
     heure_depart = models.TimeField(null=True, blank=True)
@@ -1095,6 +1095,37 @@ class Presence(models.Model):
         help_text="Historique des positions GPS ([{latitude, longitude, timestamp, distance_metres}, ...]) relevées depuis le début de l'absence"
     )
 
+    # Pointage assiste par le secretariat/accueil (agent sans smartphone ou
+    # l'ayant oublie) : la personne pointee (fiche_agent) peut n'avoir aucune
+    # ligne Agent (jamais inscrite sur l'app mobile), d'ou ce second chemin
+    # d'identite independant de `agent`. enregistre_par distingue qui a fait
+    # le geste (le secretaire) de qui est concerne (agent/fiche_agent).
+    fiche_agent = models.ForeignKey(
+        'FicheAgent', on_delete=models.SET_NULL, null=True, blank=True, related_name='presences',
+        help_text="Fiche agent RH ciblee par un pointage assiste (sans ligne Agent correspondante)"
+    )
+    enregistre_par = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='presences_enregistrees',
+        help_text="Utilisateur ayant effectue la saisie (secretaire/accueil) ; vide pour un auto-pointage"
+    )
+    VERIFICATION_METHOD_CHOICES = [
+        ('self', 'Auto-pointage'),
+        ('proxy_facial', 'Assiste — verification faciale'),
+        ('proxy_manual', 'Assiste — sans photo'),
+    ]
+    verification_method = models.CharField(max_length=20, choices=VERIFICATION_METHOD_CHOICES, default='self')
+    verification_photo = models.ImageField(upload_to='presences/verification/', null=True, blank=True)
+    liveness_passed = models.BooleanField(
+        null=True, blank=True,
+        help_text="Null = non applicable (auto-pointage ou pointage assiste sans photo)"
+    )
+    liveness_method = models.CharField(max_length=40, blank=True)
+    reference_photo_absente = models.BooleanField(
+        default=False,
+        help_text="Vrai si la FicheAgent n'avait pas de photo de reference au moment du pointage"
+    )
+
     # Pointage hors-ligne : identifiant genere cote mobile pour deduplication
     # idempotente lors de la resynchronisation, et horodatage reel de capture
     # (distinct de created_at, qui reste l'heure d'enregistrement serveur).
@@ -1113,8 +1144,17 @@ class Presence(models.Model):
     class Meta:
         verbose_name = 'Présence'
         verbose_name_plural = 'Présences'
-        unique_together = ('agent', 'date_presence')
         ordering = ['-date_presence', '-heure_arrivee']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['agent', 'date_presence'], condition=models.Q(agent__isnull=False),
+                name='uniq_presence_agent_date',
+            ),
+            models.UniqueConstraint(
+                fields=['fiche_agent', 'date_presence'], condition=models.Q(fiche_agent__isnull=False),
+                name='uniq_presence_ficheagent_date',
+            ),
+        ]
 
     def __str__(self):
         return f"{self.agent.username} - {self.date_presence} ({self.statut})"

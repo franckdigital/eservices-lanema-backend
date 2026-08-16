@@ -2027,6 +2027,95 @@ class UpdatePresenceStatusView(APIView):
             logger.error(f'[UpdatePresenceStatus] Erreur: {str(e)}')
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
+class ProxyPresenceView(APIView):
+    """Pointage assisté (secrétariat/accueil) : enregistre présent/absent pour
+    un agent qui n'a pas de smartphone ou l'a oublié. Réservé à ADMIN/SECRETAIRE
+    — piste d'audit complète via `enregistre_par` (qui a fait la saisie) et
+    `fiche_agent` (pour qui), indépendante de toute ligne `Agent` (les agents
+    visés n'ont souvent jamais été inscrits sur l'app mobile)."""
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    def post(self, request):
+        from .models import FicheAgent, Agent
+
+        caller_role = getattr(getattr(request.user, 'profile', None), 'role', None)
+        if caller_role not in ('ADMIN', 'SECRETAIRE'):
+            return Response({'error': 'Permissions insuffisantes'}, status=status.HTTP_403_FORBIDDEN)
+
+        fiche_agent_id = request.data.get('fiche_agent_id')
+        statut = request.data.get('statut')
+        verification_method = request.data.get('verification_method', 'proxy_manual')
+        verification_photo = request.FILES.get('verification_photo')
+        liveness_passed_raw = request.data.get('liveness_passed')
+        liveness_method = request.data.get('liveness_method', '')
+
+        if statut not in ('présent', 'absent'):
+            return Response({'error': 'Statut invalide'}, status=status.HTTP_400_BAD_REQUEST)
+        if verification_method not in ('proxy_manual', 'proxy_facial'):
+            return Response({'error': 'Méthode de vérification invalide.'}, status=status.HTTP_400_BAD_REQUEST)
+        if verification_method == 'proxy_facial' and not verification_photo:
+            return Response(
+                {'error': 'Photo de vérification requise pour la méthode faciale.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not fiche_agent_id:
+            return Response({'error': 'fiche_agent_id requis'}, status=status.HTTP_400_BAD_REQUEST)
+
+        liveness_passed = None
+        if verification_method == 'proxy_facial':
+            liveness_passed = str(liveness_passed_raw).lower() in ('true', '1', 'yes')
+
+        try:
+            fiche_agent = FicheAgent.objects.select_related('user').get(id=fiche_agent_id)
+        except FicheAgent.DoesNotExist:
+            return Response({'error': 'Fiche agent introuvable'}, status=status.HTTP_404_NOT_FOUND)
+
+        agent_obj = None
+        if fiche_agent.user_id:
+            agent_obj = Agent.objects.filter(user_id=fiche_agent.user_id).first()
+
+        latitude = request.data.get('latitude') or 0
+        longitude = request.data.get('longitude') or 0
+        device_fingerprint = request.data.get('device_fingerprint')
+        today = timezone.now().date()
+
+        lookup = {'fiche_agent': fiche_agent, 'date_presence': today}
+        if agent_obj is not None:
+            # Une seule ligne par (agent, date) — cherche d'abord par agent si
+            # résolu, pour rester cohérent avec un éventuel auto-pointage déjà
+            # existant ce jour-là.
+            lookup = {'agent': agent_obj, 'date_presence': today}
+
+        presence, _created = Presence.objects.update_or_create(
+            **lookup,
+            defaults={
+                'agent': agent_obj,
+                'fiche_agent': fiche_agent,
+                'statut': statut,
+                'heure_arrivee': timezone.now().time() if statut == 'présent' else None,
+                'latitude': latitude,
+                'longitude': longitude,
+                'localisation_valide': False,
+                'device_fingerprint': device_fingerprint,
+                'enregistre_par': request.user,
+                'verification_method': verification_method,
+                'verification_photo': verification_photo if verification_method == 'proxy_facial' else None,
+                'liveness_passed': liveness_passed,
+                'liveness_method': liveness_method if verification_method == 'proxy_facial' else '',
+                'reference_photo_absente': not bool(fiche_agent.photo),
+            },
+        )
+
+        logger.info(
+            '[ProxyPresenceView] %s a enregistré %s pour fiche_agent=%s (%s)',
+            request.user.username, statut, fiche_agent.id, fiche_agent.matricule,
+        )
+
+        serializer = PresenceSerializer(presence, context={'request': request})
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
 class OccurrenceSpecialeViewSet(viewsets.ModelViewSet):
     queryset = OccurrenceSpeciale.objects.all()
     serializer_class = OccurrenceSpecialeSerializer
@@ -2084,13 +2173,21 @@ class PresenceViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         import logging
         logger = logging.getLogger(__name__)
-        from rest_framework.exceptions import ValidationError
+        from rest_framework.exceptions import ValidationError, PermissionDenied
         from math import radians, cos, sin, asin, sqrt
         from .models import Agent
         logger.warning('[PresenceViewSet] Données reçues: %s', self.request.data)
         user = self.request.user
         statut = 'présent'
+        # Le pointage assisté (pointer un tiers) est réservé au flux dédié
+        # /api/presence/proxy/ (ProxyPresenceView), avec traçabilité complète
+        # de qui a fait la saisie. Ici, seuls ADMIN/SECRETAIRE peuvent cibler
+        # un user_id différent du leur — tout autre compte est refusé.
         user_id = self.request.data.get('user_id')
+        if user_id and str(user_id) != str(user.id):
+            caller_role = getattr(getattr(user, 'profile', None), 'role', None)
+            if caller_role not in ('ADMIN', 'SECRETAIRE'):
+                raise PermissionDenied("Vous ne pouvez pas enregistrer une présence pour un autre utilisateur.")
         if user_id:
             try:
                 agent_user = User.objects.get(id=user_id)

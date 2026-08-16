@@ -41,14 +41,21 @@ class FicheAgentViewSet(viewsets.ModelViewSet):
         qs = super().get_queryset()
         site_id = _get_site_id(self.request)
         if site_id:
-            qs = qs.filter(user__profile__site_id=site_id)
+            # Une FicheAgent sans compte utilisateur (agents sans smartphone,
+            # jamais inscrits) n'a aucun moyen d'être rattachée à un site —
+            # on ne les exclut donc pas du site-scoping, seulement les fiches
+            # dont le compte lié appartient explicitement à un autre site.
+            qs = qs.filter(Q(user__profile__site_id=site_id) | Q(user__isnull=True))
         statut = self.request.query_params.get('statut')
         direction = self.request.query_params.get('direction')
+        sous_direction = self.request.query_params.get('sous_direction')
         service = self.request.query_params.get('service')
         if statut:
             qs = qs.filter(statut=statut)
         if direction:
             qs = qs.filter(direction_id=direction)
+        if sous_direction:
+            qs = qs.filter(sous_direction_id=sous_direction)
         if service:
             qs = qs.filter(service_id=service)
         return qs

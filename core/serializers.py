@@ -457,6 +457,11 @@ class PresenceSerializer(serializers.ModelSerializer):
             fields = ['id', 'nom', 'prenom', 'matricule', 'poste', 'service', 'service_obj', 'bureau', 'bureau_obj']
     
     agent_details = AgentSerializer(source='agent', read_only=True)
+    fiche_agent = serializers.PrimaryKeyRelatedField(read_only=True)
+    enregistre_par = serializers.PrimaryKeyRelatedField(read_only=True)
+    enregistre_par_info = serializers.SerializerMethodField()
+    verification_photo_url = serializers.SerializerMethodField()
+    fiche_agent_photo_url = serializers.SerializerMethodField()
 
     class Meta:
         model = Presence
@@ -465,9 +470,35 @@ class PresenceSerializer(serializers.ModelSerializer):
             'heure_sortie', 'sortie_detectee', 'temps_absence_minutes', 'statut_modifiable',
             'statut', 'latitude', 'longitude', 'localisation_valide', 'device_fingerprint',
             'derniere_latitude_connue', 'derniere_longitude_connue',
-            'commentaire', 'created_at', 'updated_at'
+            'commentaire', 'created_at', 'updated_at',
+            'fiche_agent', 'enregistre_par', 'enregistre_par_info', 'verification_method',
+            'verification_photo_url', 'fiche_agent_photo_url', 'liveness_passed',
+            'liveness_method', 'reference_photo_absente',
         ]
         read_only_fields = ['id', 'agent', 'created_at', 'updated_at', 'localisation_valide']
+
+    def get_enregistre_par_info(self, obj):
+        if not obj.enregistre_par_id:
+            return None
+        from .serializers_rh import UserBriefSerializer
+        return UserBriefSerializer(obj.enregistre_par).data
+
+    def get_verification_photo_url(self, obj):
+        if obj.verification_photo:
+            request = self.context.get('request')
+            if request:
+                return request.build_absolute_uri(obj.verification_photo.url)
+        return None
+
+    def get_fiche_agent_photo_url(self, obj):
+        fiche = obj.fiche_agent
+        if fiche is None and obj.agent_id and getattr(obj.agent, 'user_id', None):
+            fiche = getattr(obj.agent.user, 'fiche_agent', None)
+        if fiche and fiche.photo:
+            request = self.context.get('request')
+            if request:
+                return request.build_absolute_uri(fiche.photo.url)
+        return None
 
 class OccurrenceSpecialeSerializer(serializers.ModelSerializer):
     agent_details = UserSerializer(source='agent', read_only=True)
