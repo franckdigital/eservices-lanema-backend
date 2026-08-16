@@ -2045,26 +2045,33 @@ class ProxyPresenceView(APIView):
 
         fiche_agent_id = request.data.get('fiche_agent_id')
         statut = request.data.get('statut')
-        verification_method = request.data.get('verification_method', 'proxy_manual')
+        verification_method = request.data.get('verification_method', 'proxy_facial')
         verification_photo = request.FILES.get('verification_photo')
         liveness_passed_raw = request.data.get('liveness_passed')
         liveness_method = request.data.get('liveness_method', '')
 
         if statut not in ('présent', 'absent'):
             return Response({'error': 'Statut invalide'}, status=status.HTTP_400_BAD_REQUEST)
-        if verification_method not in ('proxy_manual', 'proxy_facial'):
-            return Response({'error': 'Méthode de vérification invalide.'}, status=status.HTTP_400_BAD_REQUEST)
-        if verification_method == 'proxy_facial' and not verification_photo:
+        # La vérification faciale (avec photo) est obligatoire pour tout
+        # pointage assisté — c'est précisément ce qui empêche un agent de
+        # faire valider sa présence par un collègue à sa place. Le mode
+        # "proxy_manual" (sans photo) a existé un temps pour les agents sans
+        # photo de référence, mais a permis de contourner totalement la
+        # vérification lors d'un test — retiré.
+        if verification_method != 'proxy_facial':
             return Response(
-                {'error': 'Photo de vérification requise pour la méthode faciale.'},
+                {'error': 'La vérification faciale est obligatoire pour valider un pointage assisté.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not verification_photo:
+            return Response(
+                {'error': 'Photo de vérification requise pour valider ce pointage.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         if not fiche_agent_id:
             return Response({'error': 'fiche_agent_id requis'}, status=status.HTTP_400_BAD_REQUEST)
 
-        liveness_passed = None
-        if verification_method == 'proxy_facial':
-            liveness_passed = str(liveness_passed_raw).lower() in ('true', '1', 'yes')
+        liveness_passed = str(liveness_passed_raw).lower() in ('true', '1', 'yes')
 
         try:
             fiche_agent = FicheAgent.objects.select_related('user').get(id=fiche_agent_id)
@@ -2100,9 +2107,9 @@ class ProxyPresenceView(APIView):
                 'device_fingerprint': device_fingerprint,
                 'enregistre_par': request.user,
                 'verification_method': verification_method,
-                'verification_photo': verification_photo if verification_method == 'proxy_facial' else None,
+                'verification_photo': verification_photo,
                 'liveness_passed': liveness_passed,
-                'liveness_method': liveness_method if verification_method == 'proxy_facial' else '',
+                'liveness_method': liveness_method,
                 'reference_photo_absente': not bool(fiche_agent.photo),
             },
         )
