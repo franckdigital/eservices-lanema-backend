@@ -8,9 +8,17 @@ pymysql.install_as_MySQLdb()
 from pathlib import Path
 import os
 from datetime import timedelta
+from dotenv import load_dotenv
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Charge backend/.env.local si present (no-op silencieux si absent ou si les
+# variables sont deja definies au niveau du systeme/process manager) —
+# n'ecrase jamais une variable d'environnement deja definie ailleurs.
+# Nom volontairement different de ".env" : ce nom est deja pris par le
+# dossier de l'environnement virtuel Python (backend/.env/).
+load_dotenv(BASE_DIR / '.env.local')
 
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = 'django-insecure-n5e0po2v6y9=z5h#)p^f@!q3v3&amp;y=0g4x#f8_h=w=k#6z5x$q'

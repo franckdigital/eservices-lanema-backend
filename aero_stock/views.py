@@ -10,6 +10,9 @@ from .serializers import MouvementPieceRechangeSerializer, PieceRechangeSerializ
 
 DAE_ENCADREMENT = direction_permission('DAE', min_tier='encadrement')
 DAE_MEMBRE = direction_permission('DAE')
+# Encadrement, ou Magasinier de palier terrain (cf. cahier des charges DAE
+# section 29 : le magasinier gère les pièces, entrées/sorties, stocks).
+DAE_STOCK = direction_permission('DAE', min_tier='encadrement', feature_key='dae_role_magasinier')
 
 
 def compute_stock_kpis(date_debut=None, date_fin=None):
@@ -59,13 +62,13 @@ def compute_stock_kpis(date_debut=None, date_fin=None):
 class PieceRechangeViewSet(viewsets.ModelViewSet):
     queryset = PieceRechange.objects.all()
     serializer_class = PieceRechangeSerializer
-    permission_classes = [DAE_ENCADREMENT]
+    permission_classes = [DAE_STOCK]
 
 
 class MouvementPieceRechangeViewSet(viewsets.ModelViewSet):
     queryset = MouvementPieceRechange.objects.select_related("piece").all()
     serializer_class = MouvementPieceRechangeSerializer
-    permission_classes = [DAE_ENCADREMENT]
+    permission_classes = [DAE_STOCK]
 
 
 class StockKPIView(APIView):

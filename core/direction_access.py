@@ -76,6 +76,12 @@ def user_tier(user):
 
 DYNAMIC_MODULE_PERMISSION_KEYS = [
     'dae_view_finance', 'dmct_view_finance', 'dfir_view_finance', 'dfir_view_email',
+    # Rôles métier DAE de palier terrain (cf. cahier des charges section 29) :
+    # accordent, indépendamment du palier, l'accès à un module normalement
+    # réservé à l'encadrement — un Magasinier ou un Agent administratif de
+    # palier terrain peut ainsi opérer son périmètre sans devenir Chef de
+    # service. Cf. direction_permission(min_tier=..., feature_key=...) (OR).
+    'dae_role_controleur_qualite', 'dae_role_magasinier', 'dae_role_agent_administratif',
 ]
 
 
@@ -115,11 +121,18 @@ def has_dynamic_module_permission(user, feature_key):
 def direction_permission(direction_code, min_tier=None, feature_key=None):
     """Fabrique une classe de permission DRF : membre de la Direction
     `direction_code` (ou Admin, toujours autorisé), puis :
-    - si `feature_key` est fourni, l'acces est pilote dynamiquement par
-      la matrice Droits & Permissions (core.RolePermission) plutot que par
-      le palier fige du role ;
-    - sinon, palier >= `min_tier` si fourni. `min_tier` in
-      {'terrain', 'encadrement', 'direction'}."""
+    - si seul `min_tier` est fourni, palier >= `min_tier`
+      ({'terrain', 'encadrement', 'direction'}) ;
+    - si seul `feature_key` est fourni, l'acces est pilote dynamiquement par
+      la matrice Droits & Permissions (core.RolePermission) ;
+    - si les deux sont fournis, l'un OU l'autre suffit — permet par exemple
+      d'autoriser l'encadrement par defaut tout en accordant le meme acces a
+      un role metier specifique de palier terrain (ex: Magasinier,
+      Contrôleur qualité, Agent administratif — cf. cahier des charges DAE
+      section 29) via une permission dynamique dediee, sans abaisser le
+      palier minimum pour tout le monde ;
+    - si ni l'un ni l'autre n'est fourni, tout membre de la Direction est
+      autorise."""
 
     class _DirectionPermission(permissions.BasePermission):
         def has_permission(self, request, view):
@@ -133,12 +146,14 @@ def direction_permission(direction_code, min_tier=None, feature_key=None):
                 return True
             if user_direction_code(user) != direction_code:
                 return False
-            if feature_key is not None:
-                return has_dynamic_module_permission(user, feature_key)
-            if min_tier is None:
+            if min_tier is None and feature_key is None:
                 return True
-            tier = user_tier(user)
-            return tier is not None and _TIER_ORDER.get(tier, -1) >= _TIER_ORDER[min_tier]
+            tier_ok = False
+            if min_tier is not None:
+                tier = user_tier(user)
+                tier_ok = tier is not None and _TIER_ORDER.get(tier, -1) >= _TIER_ORDER[min_tier]
+            feature_ok = feature_key is not None and has_dynamic_module_permission(user, feature_key)
+            return tier_ok or feature_ok
 
     return _DirectionPermission
 

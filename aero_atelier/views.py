@@ -61,6 +61,11 @@ def compute_equipements_atelier_kpis(date_debut=None, date_fin=None):
 
     return {
         "taux_disponibilite_equipements": taux_disponibilite,
+        # KPI 13 du cahier des charges (categorie performance) : faute de
+        # suivi d'heures d'usage par equipement, approxime par le taux de
+        # disponibilite (equipement disponible = mobilisable pour les
+        # interventions de la DAE).
+        "taux_utilisation_equipements": taux_disponibilite,
         "nombre_pannes": pannes.count(),
         "temps_moyen_arret_jours": temps_moyen_arret,
         "taux_respect_planning_maintenance": taux_respect_planning,
@@ -85,7 +90,7 @@ def compute_personnel_kpis(date_debut=None, date_fin=None):
     durees_interventions = []
     for tech_id in techniciens_ids:
         ordres_tech = ordres.filter(technicien_id=tech_id)
-        termines_tech = ordres_tech.filter(statut="TERMINE", date_debut__isnull=False, date_fin__isnull=False)
+        termines_tech = ordres_tech.filter(statut__in=["TERMINE", "VALIDE", "CLOTURE"], date_debut__isnull=False, date_fin__isnull=False)
         total_interventions_realisees += termines_tech.count()
         for o in termines_tech:
             durees_interventions.append((o.date_fin - o.date_debut.date()).days)

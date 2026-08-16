@@ -145,6 +145,7 @@ urlpatterns = [
     path('api/dae/securite/', include('aero_securite.urls')),
     path('api/dae/atelier/', include('aero_atelier.urls')),
     path('api/dae/finance/', include('aero_finance.urls')),
+    path('api/dae/portail-client/', include('aero_clients.portal_urls')),
     path('api/dae/', include('aero_dashboard.urls')),
 
     # KPI decisionnels DMCT (Direction de la Metrologie et des Controles Techniques)

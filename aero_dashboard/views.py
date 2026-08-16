@@ -1,11 +1,20 @@
 from datetime import timedelta
 
+from django.contrib.contenttypes.models import ContentType
 from django.db.models import Count
 from django.utils import timezone
 
 from rest_framework import permissions
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
+
+from core.direction_access import direction_permission
+
+from .models import HistoriqueActionDAE, PieceJointeDAE
+from .serializers import HistoriqueActionDAESerializer, PieceJointeDAESerializer
+
+DAE_MEMBRE = direction_permission('DAE')
 
 from aero_atelier.views import compute_equipements_atelier_kpis, compute_personnel_kpis
 from aero_clients.views import compute_clients_kpis
@@ -27,9 +36,9 @@ def compute_strategique_kpis(maintenance, securite, qualite, date_debut=None, da
         ordres = ordres.filter(date_demande__date__range=(date_debut, date_fin))
 
     aeronefs_apres_intervention = ordres.filter(
-        statut="TERMINE", aeronef__statut="EN_SERVICE"
+        statut__in=["TERMINE", "VALIDE", "CLOTURE"], aeronef__statut="EN_SERVICE"
     ).values("aeronef").distinct().count()
-    total_aeronefs_intervenus = ordres.filter(statut="TERMINE").values("aeronef").distinct().count()
+    total_aeronefs_intervenus = ordres.filter(statut__in=["TERMINE", "VALIDE", "CLOTURE"]).values("aeronef").distinct().count()
     disponibilite_apres_intervention = (
         round(aeronefs_apres_intervention / total_aeronefs_intervenus * 100, 1)
         if total_aeronefs_intervenus else None
@@ -61,7 +70,7 @@ def compute_strategique_kpis(maintenance, securite, qualite, date_debut=None, da
         .order_by("mois")
     )
     evolution_productivite = list(
-        OrdreTravail.objects.filter(date_demande__date__gte=six_mois, statut="TERMINE")
+        OrdreTravail.objects.filter(date_demande__date__gte=six_mois, statut__in=["TERMINE", "VALIDE", "CLOTURE"])
         .annotate(mois=TruncMonth("date_demande"))
         .values("mois")
         .annotate(nombre_termines=Count("id"))
@@ -139,7 +148,7 @@ class DashboardDAEDirecteurView(APIView):
         today = timezone.now().date()
         travaux_en_retard = OrdreTravail.objects.filter(
             date_fin_prevue__lt=today
-        ).exclude(statut__in=["TERMINE", "ANNULE"]).count()
+        ).exclude(statut__in=["TERMINE", "VALIDE", "CLOTURE", "ANNULE"]).count()
 
         pieces_critiques_en_alerte = PieceRechange.objects.filter(
             est_critique=True, quantite_stock__lte=0
@@ -168,10 +177,10 @@ class DashboardDAEChefAtelierView(APIView):
         today = timezone.now().date()
 
         ordres_du_jour = OrdreTravail.objects.filter(date_demande__date=today)
-        reparations_terminees = OrdreTravail.objects.filter(statut="TERMINE", date_fin=today)
+        reparations_terminees = OrdreTravail.objects.filter(statut__in=["TERMINE", "VALIDE", "CLOTURE"], date_fin=today)
         interventions_urgentes = OrdreTravail.objects.filter(
             type_intervention="URGENCE"
-        ).exclude(statut__in=["TERMINE", "ANNULE"])
+        ).exclude(statut__in=["TERMINE", "VALIDE", "CLOTURE", "ANNULE"])
         pieces_en_rupture = PieceRechange.objects.filter(quantite_stock__lte=0)
 
         charge_par_technicien = list(
@@ -207,7 +216,7 @@ class DashboardDAETechnicienView(APIView):
         today = timezone.now().date()
 
         ordres_user = OrdreTravail.objects.filter(technicien=request.user)
-        ordres_termines = ordres_user.filter(statut="TERMINE", date_debut__isnull=False, date_fin__isnull=False)
+        ordres_termines = ordres_user.filter(statut__in=["TERMINE", "VALIDE", "CLOTURE"], date_debut__isnull=False, date_fin__isnull=False)
 
         durees = [(o.date_fin - o.date_debut.date()).days for o in ordres_termines]
         temps_moyen = round(sum(durees) / len(durees), 1) if durees else None
@@ -230,7 +239,7 @@ class DashboardDAETechnicienView(APIView):
             "interventions_assignees": total_user,
             "interventions_en_cours": ordres_user.filter(statut="EN_COURS").count(),
             "temps_moyen_par_intervention_jours": temps_moyen,
-            "maintenance_planifiee": ordres_user.filter(statut="EN_ATTENTE").count(),
+            "maintenance_planifiee": ordres_user.filter(statut__in=["A_PLANIFIER", "PLANIFIE"]).count(),
             "historique_reparations": historique_reparations,
             "objectifs_quotidiens": objectifs_jour,
             "non_conformites_liees": NonConformiteDAE.objects.filter(
@@ -238,3 +247,59 @@ class DashboardDAETechnicienView(APIView):
             ).count(),
             "score_performance": score_performance,
         })
+
+
+def _resolve_dae_content_type(request):
+    """Resout le ContentType cible depuis app_label/model (query params),
+    pour les endpoints transverses Historique/Pieces jointes — evite d'exposer
+    un id de ContentType brut cote frontend."""
+    app_label = request.query_params.get("app_label")
+    model = request.query_params.get("model")
+    if not app_label or not model:
+        return None
+    try:
+        return ContentType.objects.get(app_label=app_label, model=model.lower())
+    except ContentType.DoesNotExist:
+        return None
+
+
+class HistoriqueActionDAEListView(APIView):
+    """GET /api/dae/dashboard/historique/?app_label=aero_maintenance&model=ordretravail&object_id=5"""
+
+    permission_classes = [DAE_MEMBRE]
+
+    def get(self, request):
+        content_type = _resolve_dae_content_type(request)
+        object_id = request.query_params.get("object_id")
+        if content_type is None or not object_id:
+            return Response({"error": "app_label, model et object_id sont requis."}, status=400)
+        qs = HistoriqueActionDAE.objects.filter(content_type=content_type, object_id=object_id).select_related("utilisateur")
+        return Response(HistoriqueActionDAESerializer(qs, many=True).data)
+
+
+class PieceJointeDAEListCreateView(APIView):
+    """GET/POST /api/dae/dashboard/pieces-jointes/?app_label=...&model=...&object_id=..."""
+
+    permission_classes = [DAE_MEMBRE]
+    parser_classes = [MultiPartParser, FormParser]
+
+    def get(self, request):
+        content_type = _resolve_dae_content_type(request)
+        object_id = request.query_params.get("object_id")
+        if content_type is None or not object_id:
+            return Response({"error": "app_label, model et object_id sont requis."}, status=400)
+        qs = PieceJointeDAE.objects.filter(content_type=content_type, object_id=object_id).select_related("uploaded_by")
+        return Response(PieceJointeDAESerializer(qs, many=True, context={"request": request}).data)
+
+    def post(self, request):
+        content_type = _resolve_dae_content_type(request)
+        object_id = request.query_params.get("object_id")
+        fichier = request.FILES.get("fichier")
+        if content_type is None or not object_id:
+            return Response({"error": "app_label, model et object_id sont requis."}, status=400)
+        if not fichier:
+            return Response({"error": "Fichier requis."}, status=400)
+        piece = PieceJointeDAE.objects.create(
+            content_type=content_type, object_id=object_id, fichier=fichier, uploaded_by=request.user,
+        )
+        return Response(PieceJointeDAESerializer(piece, context={"request": request}).data, status=201)
