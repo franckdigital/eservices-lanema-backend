@@ -114,10 +114,60 @@ class ImputationFileViewSet(viewsets.ModelViewSet):
             print(f"[ERROR] ImputationFile creation failed: {str(e)}")
             raise
 
+def _sync_fiche_agent_for_user(user):
+    """Cree ou met a jour la FicheAgent (RH) liee a `user`, a partir de son
+    UserProfile : les deux enregistrements representent la meme personne
+    (identifiants/permissions cote UserProfile, dossier RH/pointage cote
+    FicheAgent) mais ne sont pas lies automatiquement par Django. Appelee a
+    la creation et a la mise a jour d'un utilisateur depuis UserViewSet, pour
+    que chaque utilisateur cree cote admin apparaisse aussi dans Fiches
+    Agents (et donc dans le pointage mobile, qui ne lit que FicheAgent)."""
+
+    from .models import FicheAgent
+
+    profile = getattr(user, 'profile', None)
+
+    fiche = getattr(user, 'fiche_agent', None)
+    if fiche is None:
+        matricule = (getattr(profile, 'matricule', None) or '').strip()
+        if not matricule:
+            matricule = f"AGT-{user.id:05d}"
+            if FicheAgent.objects.filter(matricule=matricule).exclude(user=user).exists():
+                matricule = f"AGT-{user.id:05d}-{FicheAgent.objects.count() + 1}"
+        fiche = FicheAgent(user=user, matricule=matricule)
+
+    fiche.nom = user.last_name or fiche.nom or user.username
+    fiche.prenoms = user.first_name or fiche.prenoms or ''
+    fiche.email_professionnel = user.email or fiche.email_professionnel
+    if profile is not None:
+        if getattr(profile, 'telephone', None):
+            fiche.telephone = profile.telephone
+        fiche.direction = getattr(profile, 'direction', None)
+        fiche.sous_direction = getattr(profile, 'sous_direction', None)
+        fiche.service = getattr(profile, 'service', None)
+    fiche.statut = 'actif' if user.is_active else 'suspendu'
+    fiche.save()
+    return fiche
+
+
 class UserViewSet(viewsets.ModelViewSet):
     queryset = User.objects.all()
     permission_classes = [permissions.IsAuthenticated]
     authentication_classes = [JWTAuthentication]
+
+    def perform_create(self, serializer):
+        user = serializer.save()
+        try:
+            _sync_fiche_agent_for_user(user)
+        except Exception:
+            logger.exception("Echec de la creation automatique de la fiche agent pour %s", user.username)
+
+    def perform_update(self, serializer):
+        user = serializer.save()
+        try:
+            _sync_fiche_agent_for_user(user)
+        except Exception:
+            logger.exception("Echec de la mise a jour automatique de la fiche agent pour %s", user.username)
 
     def get_queryset(self):
         print('UserViewSet: requête reçue, user =', self.request.user, 'is_authenticated =', self.request.user.is_authenticated)
