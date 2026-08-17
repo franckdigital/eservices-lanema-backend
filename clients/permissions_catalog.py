@@ -37,6 +37,7 @@ PERMISSION_CATALOG = [
 
     ("admin.users", "Administrer les utilisateurs", "Administration"),
     ("admin.proformas", "Administrer les devis", "Administration"),
+    ("admin.bons_commande", "Administrer les bons de commande", "Administration"),
     ("admin.analyses", "Administrer les demandes d'analyse", "Administration"),
     ("admin.permissions", "Administrer les permissions", "Administration"),
     ("admin.vitrine", "Administrer la vitrine du site", "Administration"),
