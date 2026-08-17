@@ -58,6 +58,110 @@ def _draw_responsable_signature(canvas_obj, x, y, document):
     canvas_obj.setFillColor(colors.black)
 
 
+def _creer_demande_analyse_si_absente(facture):
+    """Cree la DemandeAnalyse liee a une facture payee, si elle n'existe pas
+    deja. Partage entre `FactureViewSet.valider_paiement` (paiement declare
+    par le client puis valide en comptabilite) et `FactureViewSet.encaisser`
+    (paiement encaisse directement au guichet) : dans les deux cas, c'est la
+    confirmation du paiement qui declenche la reception des echantillons."""
+
+    if facture.proforma is None or facture.proforma.demande_devis is None:
+        return
+    if DemandeAnalyse.objects.filter(facture=facture).exists():
+        return
+    last_id = DemandeAnalyse.objects.count() + 1
+    DemandeAnalyse.objects.create(
+        numero=f"DA-{last_id:05d}",
+        client=facture.client,
+        demande_devis=facture.proforma.demande_devis,
+        proforma=facture.proforma,
+        facture=facture,
+        montant_ht=facture.montant_ht,
+        montant_ttc=facture.montant_ttc,
+        statut="EN_ATTENTE_ECHANTILLONS",
+    )
+
+
+def _generer_recu_caisse_pdf(facture, mode_paiement, reference, agent):
+    """Genere un recu de paiement (PDF) pour un encaissement effectue au
+    guichet : sert de justificatif auto-genere, sans que le client ou le
+    caissier n'aient a fournir de photo/scan."""
+
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.pdfgen import canvas as pdf_canvas
+
+    buffer = BytesIO()
+    c = pdf_canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+    primary = colors.HexColor("#0B57A4")
+
+    c.setFillColor(primary)
+    c.rect(0, height - 40 * mm, width, 40 * mm, fill=1, stroke=0)
+    c.setFillColor(colors.white)
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(18 * mm, height - 20 * mm, "LANEMA")
+    c.setFont("Helvetica-Bold", 14)
+    c.drawRightString(width - 18 * mm, height - 18 * mm, "REÇU DE PAIEMENT")
+    c.setFont("Helvetica", 10)
+    c.drawRightString(width - 18 * mm, height - 26 * mm, f"N° RECU-{facture.numero}")
+    c.drawRightString(width - 18 * mm, height - 32 * mm, f"Date: {timezone.now().date().strftime('%d/%m/%Y')}")
+
+    y = height - 55 * mm
+    c.setFillColor(colors.HexColor("#F3F6FB"))
+    c.roundRect(18 * mm, y - 30 * mm, width - 36 * mm, 28 * mm, 6, fill=1, stroke=0)
+    c.setFillColor(colors.black)
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(22 * mm, y - 9 * mm, "Reçu de")
+    c.setFont("Helvetica", 10)
+    client_name = getattr(getattr(facture.client, "client_profile", None), "raison_sociale", "") or facture.client.email
+    c.drawString(22 * mm, y - 15 * mm, client_name)
+    c.drawString(22 * mm, y - 20 * mm, facture.client.email)
+    c.drawString(22 * mm, y - 25 * mm, f"Pour règlement de la facture {facture.numero}")
+
+    mode_label = dict(facture.MODE_PAIEMENT_CHOICES).get(mode_paiement, mode_paiement)
+    ligne_y = y - 45 * mm
+    c.setFont("Helvetica", 11)
+    c.drawString(18 * mm, ligne_y, "Mode de paiement")
+    c.drawRightString(width - 18 * mm, ligne_y, mode_label)
+    if reference:
+        ligne_y -= 8 * mm
+        c.drawString(18 * mm, ligne_y, "Référence")
+        c.drawRightString(width - 18 * mm, ligne_y, reference)
+
+    ligne_y -= 14 * mm
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(18 * mm, ligne_y, "Montant encaissé")
+    c.drawRightString(width - 18 * mm, ligne_y, f"{facture.montant_ttc} {facture.devise}")
+
+    agent_profile = getattr(agent, "client_profile", None)
+    agent_name = agent.get_full_name() or agent.username
+    c.setFont("Helvetica", 9)
+    c.setFillColor(colors.HexColor("#334155"))
+    c.drawString(18 * mm, 30 * mm, f"Encaissé par : {agent_name}")
+    if agent_profile is not None and getattr(agent_profile, "cachet_image", None):
+        try:
+            from reportlab.lib.utils import ImageReader
+            c.drawImage(
+                ImageReader(agent_profile.cachet_image), width - 18 * mm - 26 * mm, 20 * mm,
+                width=26 * mm, height=26 * mm, preserveAspectRatio=True, mask="auto",
+            )
+        except Exception:
+            pass
+
+    c.setFillColor(colors.HexColor("#2D7EDB"))
+    c.setFont("Helvetica-Oblique", 10)
+    c.drawCentredString(width / 2, 15 * mm, "Merci pour votre confiance !")
+    c.setFillColor(colors.black)
+
+    c.showPage()
+    c.save()
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+    return pdf_bytes
+
+
 def _draw_client_signature(canvas_obj, x, y, bon_commande):
     """Dessine la signature electronique (dessinee) du client sur le PDF du
     Bon de commande, si elle a ete apposee."""
@@ -73,8 +177,8 @@ def _draw_client_signature(canvas_obj, x, y, bon_commande):
     canvas_obj.drawString(x, y, "Signature du client")
     try:
         canvas_obj.drawImage(
-            ImageReader(bon_commande.signature_client_image), x, y - 26 * mm,
-            width=45 * mm, height=22 * mm, preserveAspectRatio=True, mask="auto",
+            ImageReader(bon_commande.signature_client_image), x, y - 34 * mm,
+            width=65 * mm, height=32 * mm, preserveAspectRatio=True, mask="auto",
         )
     except Exception:
         pass
@@ -792,20 +896,82 @@ class FactureViewSet(viewsets.ModelViewSet):
         # labo va pouvoir receptionner les echantillons. Cree ici plutot qu'a
         # l'acceptation du devis, puisque le client doit desormais payer AVANT
         # que l'analyse ne soit engagee.
-        if facture.proforma is not None and facture.proforma.demande_devis is not None:
-            existing_analyse = DemandeAnalyse.objects.filter(facture=facture).first()
-            if existing_analyse is None:
-                last_id = DemandeAnalyse.objects.count() + 1
-                DemandeAnalyse.objects.create(
-                    numero=f"DA-{last_id:05d}",
-                    client=facture.client,
-                    demande_devis=facture.proforma.demande_devis,
-                    proforma=facture.proforma,
-                    facture=facture,
-                    montant_ht=facture.montant_ht,
-                    montant_ttc=facture.montant_ttc,
-                    statut="EN_ATTENTE_ECHANTILLONS",
-                )
+        _creer_demande_analyse_si_absente(facture)
+
+        serializer = self.get_serializer(facture, context={"request": request})
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["post"], url_path="encaisser")
+    def encaisser(self, request, pk=None):
+        """Encaissement direct au guichet (module caisse) : le comptable ou
+        le responsable confirme avoir recu le paiement en main propre.
+
+        Contrairement a `payer` (declaration client, a valider ensuite) et
+        `valider_paiement` (validation d'une preuve deja deposee), cette
+        action finalise le paiement en une seule etape : aucun justificatif
+        a televerser, un recu PDF est genere automatiquement et sert de
+        preuve de paiement (visible cote client comme les autres justificatifs).
+        """
+
+        facture = self.get_object()
+        user = request.user
+
+        if not user_has_permission(user, "facturation.encaisser"):
+            return Response({"detail": "Non autorisé"}, status=status.HTTP_403_FORBIDDEN)
+
+        if facture.statut not in ("EN_ATTENTE", "RETARD", "EN_ATTENTE_VALIDATION"):
+            return Response(
+                {"detail": "Cette facture ne peut pas être encaissée dans son état actuel."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Meme regle metier que pour un paiement en ligne : le bon de
+        # commande doit avoir ete signe par le client et valide par le
+        # responsable avant tout encaissement, quel que soit le canal.
+        if facture.bon_commande is None or facture.bon_commande.statut != "SIGNE_CLIENT":
+            return Response(
+                {"detail": "Le client doit d'abord signer son bon de commande avant tout encaissement."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not facture.bon_commande.signature_responsable_appliquee:
+            return Response(
+                {"detail": "Le bon de commande doit d'abord être validé par le responsable du laboratoire."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        mode_paiement = request.data.get("mode_paiement")
+        if mode_paiement not in dict(Facture.MODE_PAIEMENT_CHOICES):
+            return Response({"detail": "mode_paiement invalide"}, status=status.HTTP_400_BAD_REQUEST)
+
+        reference = (request.data.get("reference_paiement") or "").strip()
+
+        from django.core.files.base import ContentFile
+
+        recu_pdf = _generer_recu_caisse_pdf(facture, mode_paiement, reference, user)
+
+        facture.mode_paiement = mode_paiement
+        if reference:
+            facture.reference_paiement = reference
+        facture.justificatif_paiement.save(
+            f"recu_{facture.numero}.pdf", ContentFile(recu_pdf), save=False
+        )
+        facture.paiement_valide = True
+        facture.visible_client = True
+        facture.statut = "PAYEE"
+        facture.date_paiement = timezone.now().date()
+        facture.save(
+            update_fields=[
+                "mode_paiement",
+                "reference_paiement",
+                "justificatif_paiement",
+                "paiement_valide",
+                "visible_client",
+                "statut",
+                "date_paiement",
+            ]
+        )
+
+        _creer_demande_analyse_si_absente(facture)
 
         serializer = self.get_serializer(facture, context={"request": request})
         return Response(serializer.data)
