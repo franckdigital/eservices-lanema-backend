@@ -46,6 +46,14 @@ class EchantillonViewSet(viewsets.ModelViewSet):
             )
         serializer.save()
 
+        # Enregistrer un echantillon vaut confirmation de sa reception : on
+        # fait avancer automatiquement la demande d'analyse plutot que
+        # d'exiger un clic separe sur "Confirmer depot echantillons".
+        if demande is not None and demande.statut == "EN_ATTENTE_ECHANTILLONS":
+            demande.statut = "ECHANTILLONS_RECUS"
+            demande.date_depot_echantillons = timezone.now().date()
+            demande.save(update_fields=["statut", "date_depot_echantillons"])
+
     def perform_update(self, serializer):
         self._check_labo_staff()
         serializer.save()

@@ -147,9 +147,15 @@ class DemandeDevisViewSet(viewsets.ModelViewSet):
             echantillons=echantillons,
         )
 
-        # Générer automatiquement une proforma (devis côté facturation)
-        last_proforma_id = Proforma.objects.count() + 1
-        proforma_numero = f"PROF-{last_proforma_id:05d}"
+        # Générer automatiquement une proforma (devis côté facturation) en
+        # reprenant le meme suffixe numerique que la demande de devis
+        # (DEV-00013 -> PROF-00013), pour eviter la confusion entre les
+        # numeros des differents documents d'un meme dossier.
+        suffixe = numero.split("-")[-1]
+        proforma_numero = f"PROF-{suffixe}"
+        if Proforma.objects.filter(numero=proforma_numero).exists():
+            last_proforma_id = Proforma.objects.count() + 1
+            proforma_numero = f"PROF-{last_proforma_id:05d}"
         Proforma.objects.create(
             numero=proforma_numero,
             client=client,

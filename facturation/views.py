@@ -69,9 +69,14 @@ def _creer_demande_analyse_si_absente(facture):
         return
     if DemandeAnalyse.objects.filter(facture=facture).exists():
         return
-    last_id = DemandeAnalyse.objects.count() + 1
+    # Meme suffixe numerique que la facture (elle-meme alignee sur la
+    # proforma/demande de devis), pour garder un numero de dossier coherent
+    # de bout en bout : DEV-00013 / PROF-00013 / FAC-00013 / DA-00013.
+    da_numero = f"DA-{facture.numero.split('-')[-1]}"
+    if DemandeAnalyse.objects.filter(numero=da_numero).exists():
+        da_numero = f"DA-{DemandeAnalyse.objects.count() + 1:05d}"
     DemandeAnalyse.objects.create(
-        numero=f"DA-{last_id:05d}",
+        numero=da_numero,
         client=facture.client,
         demande_devis=facture.proforma.demande_devis,
         proforma=facture.proforma,
@@ -403,11 +408,21 @@ class ProformaViewSet(viewsets.ModelViewSet):
         # signer le premier et payer la seconde AVANT que la demande d'analyse
         # ne soit creee (la reception des echantillons n'intervient qu'apres
         # validation du paiement, cf. FactureViewSet.valider_paiement).
+        #
+        # Les deux documents reprennent le meme suffixe numerique que la
+        # proforma (elle-meme alignee sur la demande de devis, cf.
+        # DemandeDevisViewSet.perform_create) : DEV-00013 -> PROF-00013 ->
+        # BC-00013 / FAC-00013 -> DA-00013, pour qu'un dossier reste
+        # identifiable par un seul numero a travers tout le circuit.
+        suffixe = proforma.numero.split("-")[-1]
+
         bon_commande = BonCommande.objects.filter(proforma=proforma).first()
         if bon_commande is None:
-            last_bc_id = BonCommande.objects.count() + 1
+            bc_numero = f"BC-{suffixe}"
+            if BonCommande.objects.filter(numero=bc_numero).exists():
+                bc_numero = f"BC-{BonCommande.objects.count() + 1:05d}"
             bon_commande = BonCommande.objects.create(
-                numero=f"BC-{last_bc_id:05d}",
+                numero=bc_numero,
                 client=proforma.client,
                 proforma=proforma,
                 montant_ht=proforma.montant_ht,
@@ -418,10 +433,12 @@ class ProformaViewSet(viewsets.ModelViewSet):
 
         existing_facture = Facture.objects.filter(proforma=proforma).first()
         if existing_facture is None:
-            last_fac_id = Facture.objects.count() + 1
+            fac_numero = f"FAC-{suffixe}"
+            if Facture.objects.filter(numero=fac_numero).exists():
+                fac_numero = f"FAC-{Facture.objects.count() + 1:05d}"
             date_emission = timezone.now().date()
             Facture.objects.create(
-                numero=f"FAC-{last_fac_id:05d}",
+                numero=fac_numero,
                 client=proforma.client,
                 proforma=proforma,
                 bon_commande=bon_commande,
