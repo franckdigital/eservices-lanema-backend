@@ -1622,12 +1622,12 @@ class MesPresencesView(APIView):
                         duree = None
                 except (ValueError, IndexError):
                     pass
-            # Retard si arrivée après 8h00
+            # Retard si arrivée après 9h00
             est_en_retard = False
             if arrivee:
                 try:
                     ah, am = int(arrivee[:2]), int(arrivee[3:5])
-                    est_en_retard = (ah * 60 + am) > (8 * 60)
+                    est_en_retard = (ah * 60 + am) > (9 * 60)
                 except (ValueError, IndexError):
                     pass
 
