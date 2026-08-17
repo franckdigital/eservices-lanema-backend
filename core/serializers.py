@@ -627,7 +627,7 @@ class DirectionSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Direction
-        fields = ['id', 'nom', 'description', 'type_direction', 'nombre_services', 'services', 'created_at', 'updated_at']
+        fields = ['id', 'nom', 'description', 'type_direction', 'parent_direction', 'nombre_services', 'services', 'created_at', 'updated_at']
 
     def get_nombre_services(self, obj):
         # Utiliser la propriété du modèle qui gère le try/except

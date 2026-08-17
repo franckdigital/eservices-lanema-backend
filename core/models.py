@@ -31,6 +31,14 @@ class Direction(models.Model):
     nom = models.CharField(max_length=255)
     description = models.TextField(blank=True, null=True)
     type_direction = models.CharField(max_length=30, choices=TYPE_CHOICES, default='direction', verbose_name='Type')
+    parent_direction = models.ForeignKey(
+        'self',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='directions_filles',
+        help_text="Direction parente, pour un rattachement hierarchique entre directions (ex: Direction sous Direction Generale/Cabinet).",
+    )
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(default=timezone.now)
 
