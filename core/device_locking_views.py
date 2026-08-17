@@ -74,6 +74,17 @@ class CheckDeviceLockView(APIView):
                         'message': 'Appareil autorisé'
                     })
             else:
+                # Nouvel appareil pour ce compte : interdire les connexions
+                # simultanees sur plusieurs telephones. On identifie l'autre
+                # session via request.user (authentifie par JWT), plus fiable
+                # que le champ username soumis par le client.
+                other_lock = DeviceLock.objects.filter(user=request.user).exclude(device_id=device_id).first()
+                if other_lock:
+                    return Response({
+                        'is_locked': True,
+                        'locked_by': username,
+                        'message': "Ce compte est déjà connecté sur un autre téléphone. Déconnectez-vous d'abord sur l'autre appareil, ou contactez l'administrateur pour le libérer."
+                    })
                 # Appareil non verrouillé
                 return Response({
                     'is_locked': False,
@@ -120,6 +131,16 @@ class LockDeviceView(APIView):
                         'message': 'Appareil déjà verrouillé pour vous'
                     })
             else:
+                # Refuser la creation d'un nouveau verrouillage si ce compte a
+                # deja une session active sur un autre appareil (memes regles
+                # que CheckDeviceLockView, au cas ou cet endpoint serait
+                # appele sans passer par la verification prealable).
+                other_lock = DeviceLock.objects.filter(user=request.user).exclude(device_id=device_id).first()
+                if other_lock:
+                    return Response({
+                        'error': "Ce compte est déjà connecté sur un autre téléphone. Contactez l'administrateur pour le libérer avant de vous connecter sur ce nouvel appareil."
+                    }, status=status.HTTP_403_FORBIDDEN)
+
                 # Créer un nouveau verrouillage
                 device_lock = DeviceLock.objects.create(
                     device_id=device_id,
