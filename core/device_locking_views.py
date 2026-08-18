@@ -165,45 +165,48 @@ class LockDeviceView(APIView):
 
 
 class UnlockDeviceView(APIView):
-    """Déverrouiller un appareil (admin uniquement)"""
+    """Déverrouiller un appareil : un administrateur peut déverrouiller
+    n'importe quel appareil ; un utilisateur normal ne peut déverrouiller que
+    l'appareil actuellement verrouillé pour SON PROPRE compte (utilisé à la
+    déconnexion, pour libérer le verrou sans intervention d'un administrateur
+    et permettre une connexion sur un autre téléphone)."""
     permission_classes = [permissions.IsAuthenticated]
     authentication_classes = [JWTAuthentication]
-    
+
     def post(self, request):
         device_id = request.data.get('device_id')
-        
+
         if not device_id:
             return Response({
                 'error': 'device_id requis'
             }, status=status.HTTP_400_BAD_REQUEST)
-        
-        # Vérifier si l'utilisateur est admin
+
+        is_admin = False
         try:
-            profile = request.user.profile
-            if profile.role not in ['ADMIN', 'superadmin']:
-                return Response({
-                    'error': 'Seuls les administrateurs peuvent déverrouiller les appareils'
-                }, status=status.HTTP_403_FORBIDDEN)
-        except:
-            return Response({
-                'error': 'Profil utilisateur non trouvé'
-            }, status=status.HTTP_403_FORBIDDEN)
-        
+            is_admin = request.user.profile.role in ['ADMIN', 'superadmin']
+        except Exception:
+            is_admin = False
+
         try:
             device_lock = DeviceLock.objects.filter(device_id=device_id).first()
-            
-            if device_lock:
-                username = device_lock.username
-                device_lock.delete()
-                logger.info(f'Appareil {device_id} déverrouillé par {request.user.username}')
-                
-                return Response({
-                    'message': f'Appareil déverrouillé (était verrouillé pour {username})'
-                })
-            else:
+
+            if not device_lock:
                 return Response({
                     'message': 'Appareil non verrouillé'
                 })
+
+            if not is_admin and device_lock.user_id != request.user.id:
+                return Response({
+                    'error': "Vous ne pouvez déverrouiller que l'appareil verrouillé pour votre propre compte."
+                }, status=status.HTTP_403_FORBIDDEN)
+
+            username = device_lock.username
+            device_lock.delete()
+            logger.info(f'Appareil {device_id} déverrouillé par {request.user.username}')
+
+            return Response({
+                'message': f'Appareil déverrouillé (était verrouillé pour {username})'
+            })
                 
         except Exception as e:
             logger.error(f'Erreur déverrouillage appareil: {str(e)}')
