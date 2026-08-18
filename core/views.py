@@ -2097,6 +2097,7 @@ class ProxyPresenceView(APIView):
 
         fiche_agent_id = request.data.get('fiche_agent_id')
         statut = request.data.get('statut')
+        action = request.data.get('action', 'arrivee')  # 'arrivee' | 'depart', ignoré si statut='absent'
         verification_method = request.data.get('verification_method', 'proxy_facial')
         verification_photo = request.FILES.get('verification_photo')
         liveness_passed_raw = request.data.get('liveness_passed')
@@ -2104,6 +2105,8 @@ class ProxyPresenceView(APIView):
 
         if statut not in ('présent', 'absent'):
             return Response({'error': 'Statut invalide'}, status=status.HTTP_400_BAD_REQUEST)
+        if statut == 'présent' and action not in ('arrivee', 'depart'):
+            return Response({'error': 'action invalide'}, status=status.HTTP_400_BAD_REQUEST)
         # La vérification faciale (avec photo) est obligatoire pour tout
         # pointage assisté — c'est précisément ce qui empêche un agent de
         # faire valider sa présence par un collègue à sa place. Le mode
@@ -2169,13 +2172,12 @@ class ProxyPresenceView(APIView):
             # existant ce jour-là.
             lookup = {'agent': agent_obj, 'date_presence': today}
 
-        presence, _created = Presence.objects.update_or_create(
+        presence, created = Presence.objects.get_or_create(
             **lookup,
             defaults={
                 'agent': agent_obj,
                 'fiche_agent': fiche_agent,
                 'statut': statut,
-                'heure_arrivee': timezone.now().time() if statut == 'présent' else None,
                 'latitude': latitude,
                 'longitude': longitude,
                 'localisation_valide': False,
@@ -2190,9 +2192,55 @@ class ProxyPresenceView(APIView):
             },
         )
 
+        # Arrivée et départ sont deux pointages distincts dans la même journée
+        # (comme pour l'auto-pointage, cf. SimplePresenceView) : on ne les
+        # confond plus dans un simple update_or_create qui écrasait toujours
+        # heure_arrivee.
+        if statut == 'absent':
+            presence.statut = 'absent'
+            presence.heure_arrivee = None
+            presence.heure_depart = None
+        elif action == 'arrivee':
+            if presence.heure_arrivee and not created:
+                return Response(
+                    {'error': "Arrivée déjà enregistrée aujourd'hui pour cet agent."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            presence.statut = 'présent'
+            presence.heure_arrivee = timezone.now().time()
+        else:  # action == 'depart'
+            if not presence.heure_arrivee:
+                return Response(
+                    {'error': "Aucune arrivée enregistrée aujourd'hui pour cet agent : pointez d'abord son arrivée."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if presence.heure_depart:
+                return Response(
+                    {'error': "Départ déjà enregistré aujourd'hui pour cet agent."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            presence.statut = 'présent'
+            presence.heure_depart = timezone.now().time()
+
+        # Champs propres à ce pointage précis (photo/vérification/localisation
+        # de l'instant présent), à jour même si la ligne du jour existait déjà.
+        presence.agent = agent_obj
+        presence.fiche_agent = fiche_agent
+        presence.latitude = latitude
+        presence.longitude = longitude
+        presence.device_fingerprint = device_fingerprint
+        presence.enregistre_par = request.user
+        presence.verification_method = verification_method
+        presence.verification_photo = verification_photo
+        presence.liveness_passed = liveness_passed
+        presence.liveness_method = liveness_method
+        presence.reference_photo_absente = not bool(fiche_agent.photo)
+        presence.face_match_distance = face_match_distance
+        presence.save()
+
         logger.info(
-            '[ProxyPresenceView] %s a enregistré %s pour fiche_agent=%s (%s)',
-            request.user.username, statut, fiche_agent.id, fiche_agent.matricule,
+            '[ProxyPresenceView] %s a enregistré %s (%s) pour fiche_agent=%s (%s)',
+            request.user.username, statut, action, fiche_agent.id, fiche_agent.matricule,
         )
 
         serializer = PresenceSerializer(presence, context={'request': request})
