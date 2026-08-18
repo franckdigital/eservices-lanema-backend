@@ -53,9 +53,21 @@ class CheckDeviceLockView(APIView):
             }, status=status.HTTP_400_BAD_REQUEST)
         
         try:
+            # Les comptes ADMIN/superadmin sont exemptés de la restriction
+            # "un seul appareil" : ce sont typiquement des comptes de test/
+            # développement basculant entre Expo Go et l'app buildée, ce qui
+            # génère une empreinte d'appareil différente à chaque fois et les
+            # bloquait à tort. La restriction reste pleinement appliquée aux
+            # agents de terrain, pour qui elle a été conçue.
+            is_admin = False
+            try:
+                is_admin = request.user.profile.role in ['ADMIN', 'superadmin']
+            except Exception:
+                is_admin = False
+
             # Vérifier si l'appareil est verrouillé
             device_lock = DeviceLock.objects.filter(device_id=device_id).first()
-            
+
             if device_lock:
                 # L'appareil est verrouillé
                 if device_lock.username != username:
@@ -78,19 +90,20 @@ class CheckDeviceLockView(APIView):
                 # simultanees sur plusieurs telephones. On identifie l'autre
                 # session via request.user (authentifie par JWT), plus fiable
                 # que le champ username soumis par le client.
-                other_lock = DeviceLock.objects.filter(user=request.user).exclude(device_id=device_id).first()
-                if other_lock:
-                    return Response({
-                        'is_locked': True,
-                        'locked_by': username,
-                        'message': "Ce compte est déjà connecté sur un autre téléphone. Déconnectez-vous d'abord sur l'autre appareil, ou contactez l'administrateur pour le libérer."
-                    })
+                if not is_admin:
+                    other_lock = DeviceLock.objects.filter(user=request.user).exclude(device_id=device_id).first()
+                    if other_lock:
+                        return Response({
+                            'is_locked': True,
+                            'locked_by': username,
+                            'message': "Ce compte est déjà connecté sur un autre téléphone. Déconnectez-vous d'abord sur l'autre appareil, ou contactez l'administrateur pour le libérer."
+                        })
                 # Appareil non verrouillé
                 return Response({
                     'is_locked': False,
                     'message': 'Appareil non verrouillé'
                 })
-                
+
         except Exception as e:
             logger.error(f'Erreur vérification verrouillage: {str(e)}')
             return Response({
@@ -114,9 +127,17 @@ class LockDeviceView(APIView):
             }, status=status.HTTP_400_BAD_REQUEST)
         
         try:
+            # Voir la note dans CheckDeviceLockView : les comptes ADMIN/
+            # superadmin sont exemptés de la restriction "un seul appareil".
+            is_admin = False
+            try:
+                is_admin = request.user.profile.role in ['ADMIN', 'superadmin']
+            except Exception:
+                is_admin = False
+
             # Vérifier si l'appareil est déjà verrouillé
             device_lock = DeviceLock.objects.filter(device_id=device_id).first()
-            
+
             if device_lock:
                 if device_lock.username != username:
                     # Verrouillé pour un autre utilisateur
@@ -135,11 +156,12 @@ class LockDeviceView(APIView):
                 # deja une session active sur un autre appareil (memes regles
                 # que CheckDeviceLockView, au cas ou cet endpoint serait
                 # appele sans passer par la verification prealable).
-                other_lock = DeviceLock.objects.filter(user=request.user).exclude(device_id=device_id).first()
-                if other_lock:
-                    return Response({
-                        'error': "Ce compte est déjà connecté sur un autre téléphone. Contactez l'administrateur pour le libérer avant de vous connecter sur ce nouvel appareil."
-                    }, status=status.HTTP_403_FORBIDDEN)
+                if not is_admin:
+                    other_lock = DeviceLock.objects.filter(user=request.user).exclude(device_id=device_id).first()
+                    if other_lock:
+                        return Response({
+                            'error': "Ce compte est déjà connecté sur un autre téléphone. Contactez l'administrateur pour le libérer avant de vous connecter sur ce nouvel appareil."
+                        }, status=status.HTTP_403_FORBIDDEN)
 
                 # Créer un nouveau verrouillage
                 device_lock = DeviceLock.objects.create(
