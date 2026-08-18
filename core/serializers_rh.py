@@ -25,6 +25,7 @@ class FicheAgentSerializer(serializers.ModelSerializer):
     user_info = UserBriefSerializer(source='user', read_only=True)
     photo_url = serializers.SerializerMethodField()
     anciennete = serializers.SerializerMethodField()
+    presence_aujourdhui = serializers.SerializerMethodField()
 
     class Meta:
         model = FicheAgent
@@ -36,6 +37,28 @@ class FicheAgentSerializer(serializers.ModelSerializer):
             if request:
                 return request.build_absolute_uri(obj.photo.url)
         return None
+
+    def get_presence_aujourdhui(self, obj):
+        """Etat du pointage du jour pour cette fiche, tous canaux confondus
+        (assiste via fiche_agent, ou auto-pointage via l'Agent lie) — utilise
+        par l'ecran mobile "pointage-agents" pour activer/griser les boutons
+        Arrivee/Depart selon ce qui a deja ete enregistre aujourd'hui."""
+        from django.db.models import Q
+        from django.utils import timezone
+        from .models import Presence
+
+        today = timezone.now().date()
+        query = Q(fiche_agent=obj)
+        if obj.user_id:
+            query |= Q(agent__user_id=obj.user_id)
+        presence = Presence.objects.filter(query, date_presence=today).order_by('-updated_at').first()
+        if not presence:
+            return None
+        return {
+            'heure_arrivee': presence.heure_arrivee.strftime('%H:%M:%S') if presence.heure_arrivee else None,
+            'heure_depart': presence.heure_depart.strftime('%H:%M:%S') if presence.heure_depart else None,
+            'statut': presence.statut,
+        }
 
     def get_anciennete(self, obj):
         if obj.date_prise_service:
