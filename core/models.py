@@ -2495,3 +2495,51 @@ class SitePalier(models.Model):
 
     def __str__(self):
         return f"{self.site.nom} — {self.nom}"
+
+
+class UserAuditLog(models.Model):
+    """Journal d'audit des opérations sur les comptes utilisateurs (création,
+    modification, suppression, changement de mot de passe) réalisées via l'API
+    d'administration. Permet de savoir QUI a fait QUOI et QUAND."""
+
+    ACTION_CREATE = 'create'
+    ACTION_UPDATE = 'update'
+    ACTION_DELETE = 'delete'
+    ACTION_PASSWORD = 'password_change'
+    ACTION_CHOICES = [
+        (ACTION_CREATE, 'Création'),
+        (ACTION_UPDATE, 'Modification'),
+        (ACTION_DELETE, 'Suppression'),
+        (ACTION_PASSWORD, 'Changement de mot de passe'),
+    ]
+
+    action = models.CharField(max_length=20, choices=ACTION_CHOICES)
+
+    # Cible de l'opération
+    target_user = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='audit_logs_as_target',
+    )
+    target_username = models.CharField(max_length=150, blank=True)
+
+    # Auteur de l'opération
+    acting_user = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='audit_logs_as_actor',
+    )
+    acting_username = models.CharField(max_length=150, blank=True)
+
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.CharField(max_length=400, blank=True)
+    changes = models.JSONField(default=dict, blank=True,
+                               help_text='Données envoyées / champs modifiés (mot de passe masqué).')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Journal d'audit utilisateur"
+        verbose_name_plural = "Journaux d'audit utilisateurs"
+        ordering = ['-created_at']
+
+    def __str__(self):
+        who = self.acting_username or 'inconnu'
+        return f"[{self.created_at:%Y-%m-%d %H:%M}] {who} → {self.get_action_display()} {self.target_username}"

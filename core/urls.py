@@ -11,7 +11,8 @@ from .views import (
     CustomTokenObtainPairView, MaPresenceDuJourView, MesPresencesView, SimplePresenceView, PresenceSyncView, AgentRegistrationView,
     ProxyPresenceView,
     DiligenceDownloadFichierView, OccurrenceSpecialeViewSet, SiteViewSet, SitePalierViewSet,
-    CourrierInstructionViewSet, CourrierAnnexeViewSet, PresenceSummaryView
+    CourrierInstructionViewSet, CourrierAnnexeViewSet, PresenceSummaryView,
+    UserAuditLogViewSet
 )
 from .views_courrier_access import CourrierAccessViewSet
 from .views_courrier_stats import CourrierStatsViewSet
@@ -47,6 +48,7 @@ from .serializers import MyTokenObtainPairSerializer
 
 router = DefaultRouter()
 router.register(r'users', UserViewSet)
+router.register(r'user-audit-logs', UserAuditLogViewSet, basename='user-audit-log')
 router.register(r'directions', DirectionViewSet)
 router.register(r'sous-directions', SousDirectionViewSet)
 router.register(r'services', ServiceViewSet)

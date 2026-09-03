@@ -150,6 +150,91 @@ def _sync_fiche_agent_for_user(user):
     return fiche
 
 
+def _client_ip(request):
+    xff = request.META.get('HTTP_X_FORWARDED_FOR', '')
+    if xff:
+        return xff.split(',')[0].strip()
+    return request.META.get('REMOTE_ADDR')
+
+
+def _audit_user_action(request, action, target_user, data):
+    """Enregistre dans UserAuditLog (et dans les logs applicatifs) qui a créé /
+    modifié / supprimé le compte `target_user`."""
+    from .models import UserAuditLog
+
+    actor = getattr(request, 'user', None)
+    actor = actor if getattr(actor, 'is_authenticated', False) else None
+
+    # Copie assainie des données envoyées (mot de passe jamais stocké en clair)
+    def _clean(value):
+        if isinstance(value, dict):
+            return {k: ('***' if k in ('password', 'password2', 'new_password')
+                       else _clean(v)) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_clean(v) for v in value]
+        if hasattr(value, 'pk'):
+            return getattr(value, 'pk', str(value))
+        return value
+
+    safe_changes = {}
+    try:
+        safe_changes = _clean(dict(data or {}))
+        safe_changes = json.loads(json.dumps(safe_changes, default=str))
+    except Exception:
+        safe_changes = {}
+
+    try:
+        UserAuditLog.objects.create(
+            action=action,
+            target_user=target_user,
+            target_username=getattr(target_user, 'username', '') or '',
+            acting_user=actor,
+            acting_username=getattr(actor, 'username', '') or '',
+            ip_address=_client_ip(request),
+            user_agent=(request.META.get('HTTP_USER_AGENT', '') or '')[:400],
+            changes=safe_changes,
+        )
+    except Exception:
+        logger.exception("Echec d'ecriture du journal d'audit utilisateur")
+
+    logger.info(
+        "AUDIT user.%s | acteur=%s (ip=%s) | cible=%s",
+        action,
+        getattr(actor, 'username', 'anonyme'),
+        _client_ip(request),
+        getattr(target_user, 'username', '?'),
+    )
+
+
+class UserAuditLogViewSet(viewsets.ReadOnlyModelViewSet):
+    """Consultation du journal d'audit des comptes utilisateurs (lecture seule).
+    Filtres : ?target=<username|id>, ?actor=<username>, ?action=create|update|delete
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    def get_serializer_class(self):
+        from .serializers import UserAuditLogSerializer
+        return UserAuditLogSerializer
+
+    def get_queryset(self):
+        from .models import UserAuditLog
+        qs = UserAuditLog.objects.select_related('acting_user', 'target_user').all()
+        target = self.request.query_params.get('target')
+        if target:
+            if str(target).isdigit():
+                qs = qs.filter(target_user_id=target)
+            else:
+                qs = qs.filter(target_username__icontains=target)
+        actor = self.request.query_params.get('actor')
+        if actor:
+            qs = qs.filter(acting_username__icontains=actor)
+        act = self.request.query_params.get('action')
+        if act:
+            qs = qs.filter(action=act)
+        return qs
+
+
 class UserViewSet(viewsets.ModelViewSet):
     queryset = User.objects.all()
     permission_classes = [permissions.IsAuthenticated]
@@ -157,17 +242,29 @@ class UserViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         user = serializer.save()
+        _audit_user_action(self.request, 'create', user, serializer.validated_data)
         try:
             _sync_fiche_agent_for_user(user)
         except Exception:
             logger.exception("Echec de la creation automatique de la fiche agent pour %s", user.username)
 
     def perform_update(self, serializer):
+        payload = dict(serializer.validated_data)
+        pwd_changed = bool(self.request.data.get('password'))
         user = serializer.save()
+        _audit_user_action(
+            self.request,
+            'password_change' if pwd_changed else 'update',
+            user, payload,
+        )
         try:
             _sync_fiche_agent_for_user(user)
         except Exception:
             logger.exception("Echec de la mise a jour automatique de la fiche agent pour %s", user.username)
+
+    def perform_destroy(self, instance):
+        _audit_user_action(self.request, 'delete', instance, {})
+        super().perform_destroy(instance)
 
     def get_queryset(self):
         print('UserViewSet: requête reçue, user =', self.request.user, 'is_authenticated =', self.request.user.is_authenticated)

@@ -19,7 +19,7 @@ from core.models import (
     Fichier, Commentaire, Tache, Activite, Domaine, Projet,
     GeofenceAlert, GeofenceSettings, AgentLocation, PushNotificationToken,
     OccurrenceSpeciale, RendezVous, RendezVousDocument, Reunion, ReunionPresence,
-    Site, SitePalier, CourrierInstruction, CourrierAnnexe
+    Site, SitePalier, CourrierInstruction, CourrierAnnexe, UserAuditLog
 )
 
 class ImputationFileSerializer(serializers.ModelSerializer):
@@ -128,6 +128,30 @@ class BasicUserSerializer(serializers.ModelSerializer):
         model = User
         fields = ['id', 'username', 'email', 'first_name', 'last_name', 'telephone', 'service', 'role_id']
         read_only_fields = ['id']
+
+class UserAuditLogSerializer(serializers.ModelSerializer):
+    acteur = serializers.SerializerMethodField()
+    cible = serializers.SerializerMethodField()
+    action_label = serializers.CharField(source='get_action_display', read_only=True)
+
+    class Meta:
+        model = UserAuditLog
+        fields = ['id', 'action', 'action_label', 'acteur', 'acting_username',
+                  'cible', 'target_username', 'ip_address', 'user_agent',
+                  'changes', 'created_at']
+
+    def _fmt(self, u, fallback):
+        if not u:
+            return fallback or None
+        return {'id': u.id, 'username': u.username,
+                'nom_complet': f"{u.first_name} {u.last_name}".strip() or u.username}
+
+    def get_acteur(self, obj):
+        return self._fmt(obj.acting_user, obj.acting_username)
+
+    def get_cible(self, obj):
+        return self._fmt(obj.target_user, obj.target_username)
+
 
 class TacheHistoriqueSerializer(serializers.ModelSerializer):
     utilisateur = BasicUserSerializer(read_only=True)

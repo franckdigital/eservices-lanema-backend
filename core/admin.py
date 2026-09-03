@@ -3,6 +3,22 @@ from .models import *
 
 admin.site.register(UserProfile)
 
+
+@admin.register(UserAuditLog)
+class UserAuditLogAdmin(admin.ModelAdmin):
+    list_display = ('created_at', 'action', 'acting_username', 'target_username', 'ip_address')
+    list_filter = ('action', 'created_at')
+    search_fields = ('acting_username', 'target_username', 'ip_address')
+    readonly_fields = ('action', 'target_user', 'target_username', 'acting_user',
+                       'acting_username', 'ip_address', 'user_agent', 'changes', 'created_at')
+    date_hierarchy = 'created_at'
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
 # --- MODULE AGENDA ---
 admin.site.register(RendezVous)
 admin.site.register(RendezVousDocument)
