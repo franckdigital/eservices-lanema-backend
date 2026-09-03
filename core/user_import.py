@@ -178,16 +178,59 @@ def parse_import_file(django_file):
     return rows, warnings
 
 
-def _resolve_fk(model, name, extra_filter=None, label=''):
+# alias sigle -> fragment de nom de direction en base
+DIR_ALIASES = {
+    'dg': 'lanema - dg', 'dgl': 'lanema - dg',
+    'daaf': 'daaf', 'dmct': 'dmct', 'dea': 'dea', 'dae': 'dae',
+    'dfir': 'dfir', 'dqfrd': 'dfir', 'dqrd': 'dfir',
+    'dsi': 'dsi',
+}
+
+
+def _sigle(nom):
+    """Extrait le sigle d'un nom type 'Direction ... - DAAF' -> 'DAAF'."""
+    parts = str(nom).replace('–', '-').split('-')
+    return parts[-1].strip() if len(parts) > 1 else ''
+
+
+def resolve_direction_any(name):
+    """Résout une direction quel que soit son type, par nom OU par sigle
+    (DG, DAAF, DQFRD…). Renvoie l'objet Direction ou None."""
     if not name:
         return None
+    n = _norm(name)
+    frag = DIR_ALIASES.get(n, n)
+    # 1) nom exact / contient
+    obj = Direction.objects.filter(nom__iexact=name.strip()).first()
+    if obj:
+        return obj
+    obj = Direction.objects.filter(nom__icontains=frag).first()
+    if obj:
+        return obj
+    # 2) par sigle (fin du nom)
+    for d in Direction.objects.all():
+        if _norm(_sigle(d.nom)) == n:
+            return d
+    return None
+
+
+def _resolve_fk(model, name, extra_filter=None, label=''):
+    """Résolution tolérante : renvoie l'objet, ou None si `name` est vide.
+    Lève ValueError seulement si `name` est fourni mais introuvable."""
+    if not name:
+        return None
+    name = name.strip()
     qs = model.objects.all()
     if extra_filter:
         qs = qs.filter(**extra_filter)
-    obj = qs.filter(nom__iexact=name.strip()).first()
-    if obj is None:
-        # tolérance : recherche "contient"
-        obj = qs.filter(nom__icontains=name.strip()).first()
+    obj = (qs.filter(nom__iexact=name).first()
+           or qs.filter(nom__icontains=name).first())
+    if obj is None and not extra_filter:
+        # recherche inverse : le nom en base est contenu dans la valeur saisie
+        for o in qs:
+            if _norm(o.nom) and _norm(o.nom) in _norm(name):
+                obj = o
+                break
     if obj is None:
         raise ValueError(f"{label or model.__name__} introuvable : « {name} »")
     return obj
@@ -197,15 +240,34 @@ def _row_to_error(index, message):
     return {'ligne': index + 2, 'erreur': message}  # +2 : en-tête + base 1
 
 
-@transaction.atomic
 def import_users(rows, *, actor=None, request=None, dry_run=False):
-    """Crée les utilisateurs. Retourne un rapport.
-    En cas de dry_run, tout est annulé (rollback) après validation.
+    """Import partiel & tolérant : chaque ligne valide est créée dans son propre
+    savepoint ; une ligne en échec est ignorée sans bloquer les autres.
+    dry_run=True : tout est validé puis annulé (rollback global).
     """
+    if dry_run:
+        with transaction.atomic():
+            rapport = _do_import(rows, actor, request, dry_run=True)
+            transaction.set_rollback(True)
+        return rapport
+    return _do_import(rows, actor, request, dry_run=False)
+
+
+def _do_import(rows, actor, request, dry_run):
     from .views import _sync_fiche_agent_for_user, _audit_user_action
 
-    crees, erreurs, roles_deduits = [], [], []
+    crees, erreurs, roles_deduits, non_resolus = [], [], [], []
     vus_username, vus_email, vus_tel = set(), set(), set()
+
+    def _fk(model, val, extra, label):
+        """Résolution non bloquante : None si introuvable, + note dans non_resolus."""
+        if not val:
+            return None
+        try:
+            return _resolve_fk(model, val, extra, label)
+        except ValueError as e:
+            non_resolus.append(f"ligne {i + 2} : {e}")
+            return None
 
     for i, row in enumerate(rows):
         try:
@@ -264,37 +326,52 @@ def import_users(rows, *, actor=None, request=None, dry_run=False):
             # Import admin en masse : on n'applique que la longueur minimale (déjà
             # vérifiée ci-dessus), pas les autres règles de complexité globales.
 
-            # --- résolution des rattachements ---
-            cabinet = _resolve_fk(Direction, row.get('cabinet'),
-                                  {'type_direction': 'cabinet'}, 'Cabinet')
-            dg = _resolve_fk(Direction, row.get('direction_generale'),
-                             {'type_direction': 'direction_generale'}, 'Direction Générale')
-            direction = _resolve_fk(Direction, row.get('direction'),
-                                    {'type_direction': 'direction'}, 'Direction')
-            sous_direction = _resolve_fk(SousDirection, row.get('sous_direction'),
-                                         None, 'Sous-Direction')
-            service = _resolve_fk(Service, row.get('service'), None, 'Service')
-            site = _resolve_fk(Site, row.get('site'), None, 'Site')
+            # --- résolution des rattachements (non bloquante) ---
+            cabinet = _fk(Direction, row.get('cabinet'), {'type_direction': 'cabinet'}, 'Cabinet')
+            dg = _fk(Direction, row.get('direction_generale'),
+                     {'type_direction': 'direction_generale'}, 'Direction Générale')
+            sous_direction = _fk(SousDirection, row.get('sous_direction'), None, 'Sous-Direction')
+            service = _fk(Service, row.get('service'), None, 'Service')
+            site = _fk(Site, row.get('site'), None, 'Site')
 
-            # --- création ---
-            user = User.objects.create_user(
-                username=username, email=email, password=password,
-                first_name=prenom, last_name=nom, is_active=actif,
-            )
-            # le signal post_save a déjà créé le profil
-            profile = UserProfile.objects.get(user=user)
-            profile.role = role
-            profile.cabinet = cabinet
-            profile.direction_generale = dg
-            profile.direction = direction
-            profile.sous_direction = sous_direction
-            profile.service = service
-            profile.site = site
-            if telephone:
-                profile.telephone = telephone
-            if matricule:
-                profile.matricule = matricule
-            profile.save()
+            direction = None
+            dir_saisie = (row.get('direction') or '').strip()
+            if dir_saisie:
+                direction = resolve_direction_any(dir_saisie)
+                if direction is None:
+                    non_resolus.append(f"ligne {i + 2} : Direction introuvable : « {dir_saisie} »")
+
+            # cohérence : si le service a une sous-direction/direction, on complète
+            if service is not None:
+                if sous_direction is None and getattr(service, 'sous_direction_id', None):
+                    sous_direction = service.sous_direction
+                if direction is None and sous_direction is not None:
+                    direction = sous_direction.direction
+                elif direction is None and getattr(service, 'direction_id', None):
+                    direction = service.direction
+            if direction is None and sous_direction is not None:
+                direction = sous_direction.direction
+
+            # --- création (savepoint par ligne) ---
+            with transaction.atomic():
+                user = User.objects.create_user(
+                    username=username, email=email, password=password,
+                    first_name=prenom, last_name=nom, is_active=actif,
+                )
+                # le signal post_save a déjà créé le profil
+                profile = UserProfile.objects.get(user=user)
+                profile.role = role
+                profile.cabinet = cabinet
+                profile.direction_generale = dg
+                profile.direction = direction
+                profile.sous_direction = sous_direction
+                profile.service = service
+                profile.site = site
+                if telephone:
+                    profile.telephone = telephone
+                if matricule:
+                    profile.matricule = matricule
+                profile.save()
 
             try:
                 fiche = _sync_fiche_agent_for_user(user)
@@ -341,19 +418,21 @@ def import_users(rows, *, actor=None, request=None, dry_run=False):
     rapport = {
         'total': len(rows),
         'crees': len(crees),
-        'erreurs': len(erreurs),
+        'erreurs': len(erreurs),           # lignes ignorées (les autres sont créées)
         'details_crees': crees,
         'details_erreurs': erreurs,
         'roles_deduits': roles_deduits,
+        'non_resolus': non_resolus,        # direction/service non trouvés (compte quand même créé, champ laissé vide)
         'dry_run': dry_run,
     }
 
-    if dry_run or erreurs:
-        # dry-run OU au moins une erreur → on annule tout (import "tout ou rien")
-        transaction.set_rollback(True)
-        if erreurs and not dry_run:
-            rapport['annule'] = True
-            rapport['message'] = ("Import annulé : corrigez les erreurs ci-dessous "
-                                  "puis réimportez le fichier complet.")
+    if dry_run:
+        transaction.set_rollback(True)      # simulation : rien n'est conservé
+    elif erreurs:
+        rapport['message'] = (
+            f"{len(crees)} compte(s) créé(s), {len(erreurs)} ligne(s) ignorée(s) "
+            f"(username/email manquant ou en double). Corrigez ces lignes et "
+            f"réimportez UNIQUEMENT celles-ci."
+        )
 
     return rapport
