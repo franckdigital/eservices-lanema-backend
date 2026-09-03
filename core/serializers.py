@@ -62,26 +62,32 @@ class MyTokenObtainPairSerializer(TokenObtainPairSerializer):
                 
         # 3. Recherche par téléphone — comparaison sur les chiffres uniquement.
         # La numérotation ivoirienne conserve le 0 initial même en format
-        # international (+225 07 XX XX XX XX), donc les 10 derniers chiffres
+        # international (+225 07 XX XX XX XX), donc les 8 à 10 derniers chiffres
         # identifient le numéro qu'il soit saisi avec ou sans l'indicatif +225.
         if user is None:
-            digits = re.sub(r'\D', '', username)
+            digits = re.sub(r'\D', '', username or '')
             national_number = digits[-10:] if len(digits) >= 8 else None
             if national_number:
-                try:
-                    profile = (
-                        UserProfile.objects
-                        .annotate(tel_digits=Replace(
-                            Replace(Replace('telephone', Value(' '), Value('')), Value('-'), Value('')),
-                            Value('+'), Value(''),
-                        ))
-                        .get(tel_digits__endswith=national_number)
-                    )
-                    user_obj = profile.user
-                    if user_obj.check_password(password):
-                        user = user_obj
-                except (UserProfile.DoesNotExist, UserProfile.MultipleObjectsReturned):
-                    pass
+                # On filtre grossièrement en base (retire les séparateurs les plus
+                # courants), puis on compare proprement les chiffres seuls en Python
+                # pour couvrir tous les formats de saisie et gérer les doublons.
+                candidats = (
+                    UserProfile.objects
+                    .exclude(telephone__isnull=True)
+                    .exclude(telephone='')
+                    .annotate(tel_digits=Replace(Replace(Replace(Replace(
+                        'telephone', Value(' '), Value('')), Value('-'), Value('')),
+                        Value('+'), Value('')), Value('.'), Value('')))
+                    .filter(tel_digits__contains=national_number)
+                    .select_related('user')
+                )
+                for profile in candidats:
+                    prof_digits = re.sub(r'\D', '', profile.telephone or '')
+                    if not prof_digits.endswith(national_number):
+                        continue
+                    if profile.user and profile.user.check_password(password):
+                        user = profile.user
+                        break
                 
         if user is None:
             raise AuthenticationFailed('Aucun utilisateur trouvé')
