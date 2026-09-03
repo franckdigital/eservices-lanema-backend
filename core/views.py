@@ -276,7 +276,8 @@ class UserViewSet(viewsets.ModelViewSet):
         w = _csv.writer(buf, delimiter=';')
         w.writerow(CANON_HEADERS)
         w.writerow(['j.dupont', 'MotDePasse123', 'Jean', 'Dupont', 'j.dupont@lanema.ci',
-                    '+2250700000000', '', 'AGENT', '', '', 'Direction des Systèmes d\'Information - DSI',
+                    '+2250700000000', '', 'AGENT', 'Technicien de laboratoire', '', '',
+                    '', '', "Direction des Systèmes d'Information - DSI",
                     'Sous-Direction Support et Assistance', 'Service Support aux Utilisateurs', '', 'OUI'])
         content = '﻿' + buf.getvalue()  # BOM pour Excel
         resp = HttpResponse(content, content_type='text/csv; charset=utf-8')

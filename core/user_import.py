@@ -10,8 +10,17 @@ Colonnes reconnues (insensible à la casse / aux accents, FR ou EN) :
   email*           email unique
   telephone        unique ; format libre (ex: +2250700000000)
   matricule        unique ; si vide → généré automatiquement (Mxxxxx)
-  role*            ADMIN | DIRECTEUR | SOUS_DIRECTEUR | CHEF_SERVICE |
-                   SUPERIEUR | AGENT | SECRETAIRE | PRESTATAIRE
+  role             rôle de PERMISSION (pas l'intitulé du poste). Accepté :
+                   - un code : ADMIN, DIRECTEUR, SOUS_DIRECTEUR, CHEF_SERVICE,
+                     SUPERIEUR, AGENT, SECRETAIRE, PRESTATAIRE
+                   - un libellé FR : "Directeur", "Chef de Service", "Agent"…
+                   - à défaut, l'intitulé de poste est analysé pour en déduire
+                     le rôle (ex. "Chef de Service Paie" → CHEF_SERVICE ;
+                     tout le reste → AGENT). Les déductions sont signalées.
+                   Vide → AGENT.
+  poste / fonction intitulé réel du poste (ex. "Technicien Supérieur Métrologie")
+  emploi           emploi (RH)
+  grade            grade (RH)
   cabinet          nom exact d'une Direction de type "cabinet"
   direction_generale  nom exact d'une Direction de type "direction_generale"
   direction        nom exact d'une Direction de type "direction"
@@ -37,6 +46,46 @@ from .models import UserProfile, Direction, SousDirection, Service, Site
 
 ROLES_VALIDES = {c[0] for c in UserProfile.ROLE_CHOICES}
 
+# libellés FR (et variantes sans accent) -> code de rôle
+ROLE_LABELS = {
+    'admin': 'ADMIN', 'administrateur': 'ADMIN',
+    'directeur': 'DIRECTEUR', 'directrice': 'DIRECTEUR',
+    'sous-directeur': 'SOUS_DIRECTEUR', 'sous directeur': 'SOUS_DIRECTEUR',
+    'sous-directrice': 'SOUS_DIRECTEUR', 'sous directrice': 'SOUS_DIRECTEUR',
+    'chef de service': 'CHEF_SERVICE', 'chef service': 'CHEF_SERVICE',
+    'superieur': 'SUPERIEUR', 'supérieur': 'SUPERIEUR',
+    'agent': 'AGENT',
+    'secretaire': 'SECRETAIRE', 'secrétaire': 'SECRETAIRE',
+    'prestataire': 'PRESTATAIRE',
+}
+
+
+def resolve_role(value):
+    """Retourne (code_role, exact).
+    exact=False si la valeur a été déduite d'un intitulé de poste (→ à vérifier).
+    Une valeur non reconnue renvoie ('AGENT', False)."""
+    raw = (value or '').strip()
+    if not raw:
+        return 'AGENT', True
+    up = raw.upper().replace('_', ' ').strip()
+    if up.replace(' ', '_') in ROLES_VALIDES:
+        return up.replace(' ', '_'), True
+    n = _norm(raw)
+    if n in ROLE_LABELS:
+        return ROLE_LABELS[n], True
+    # déduction depuis un intitulé de poste
+    if 'sous' in n and 'direct' in n:
+        return 'SOUS_DIRECTEUR', False
+    if 'directeur' in n or 'directrice' in n:
+        return 'DIRECTEUR', False
+    if 'chef' in n and ('service' in n or 'bureau' in n or 'division' in n or 'cellule' in n):
+        return 'CHEF_SERVICE', False
+    if 'secretaire' in n and 'direction' in n:
+        return 'SECRETAIRE', False
+    if 'prestataire' in n or 'consultant' in n:
+        return 'PRESTATAIRE', False
+    return 'AGENT', False
+
 # alias de colonnes -> nom canonique
 COLONNES = {
     'username': 'username', 'identifiant': 'username', "nom d'utilisateur": 'username',
@@ -46,7 +95,10 @@ COLONNES = {
     'email': 'email', 'mail': 'email', 'courriel': 'email',
     'telephone': 'telephone', 'tel': 'telephone', 'phone': 'telephone', 'contact': 'telephone',
     'matricule': 'matricule',
-    'role': 'role', 'rôle': 'role', 'fonction': 'role',
+    'role': 'role', 'rôle': 'role', 'profil': 'role',
+    'poste': 'poste', 'fonction': 'poste', 'intitule du poste': 'poste',
+    'emploi': 'emploi',
+    'grade': 'grade',
     'cabinet': 'cabinet',
     'direction_generale': 'direction_generale', 'direction generale': 'direction_generale',
     'dg': 'direction_generale',
@@ -59,7 +111,8 @@ COLONNES = {
 }
 
 CANON_HEADERS = ['username', 'password', 'prenom', 'nom', 'email', 'telephone',
-                 'matricule', 'role', 'cabinet', 'direction_generale', 'direction',
+                 'matricule', 'role', 'poste', 'emploi', 'grade',
+                 'cabinet', 'direction_generale', 'direction',
                  'sous_direction', 'service', 'site', 'actif']
 
 
@@ -152,7 +205,7 @@ def import_users(rows, *, actor=None, request=None, dry_run=False):
     """
     from .views import _sync_fiche_agent_for_user, _audit_user_action
 
-    crees, erreurs = [], []
+    crees, erreurs, roles_deduits = [], [], []
     vus_username, vus_email, vus_tel = set(), set(), set()
 
     for i, row in enumerate(rows):
@@ -164,7 +217,11 @@ def import_users(rows, *, actor=None, request=None, dry_run=False):
             email = (row.get('email') or '').strip().lower()
             telephone = (row.get('telephone') or '').strip() or None
             matricule = (row.get('matricule') or '').strip() or None
-            role = (row.get('role') or 'AGENT').strip().upper()
+            role_saisi = (row.get('role') or '').strip()
+            role, role_exact = resolve_role(role_saisi)
+            poste = (row.get('poste') or '').strip() or role_saisi  # à défaut, l'intitulé saisi
+            emploi = (row.get('emploi') or '').strip()
+            grade = (row.get('grade') or '').strip()
             actif = _norm(row.get('actif') or 'oui') not in ('non', 'no', 'false', '0', 'inactif')
 
             # --- validations ---
@@ -182,8 +239,10 @@ def import_users(rows, *, actor=None, request=None, dry_run=False):
                 validate_email(email)
             except DjangoValidationError:
                 raise ValueError(f"email invalide : {email}")
-            if role not in ROLES_VALIDES:
-                raise ValueError(f"role invalide : {role} (attendus : {', '.join(sorted(ROLES_VALIDES))})")
+            if role_saisi and not role_exact:
+                roles_deduits.append(
+                    f"ligne {i + 2} : « {role_saisi} » → {role} (à vérifier)"
+                )
 
             # doublons dans le fichier
             if username.lower() in vus_username:
@@ -241,7 +300,27 @@ def import_users(rows, *, actor=None, request=None, dry_run=False):
             profile.save()
 
             try:
-                _sync_fiche_agent_for_user(user)
+                fiche = _sync_fiche_agent_for_user(user)
+                if fiche is not None:
+                    champs = []
+                    if poste and not fiche.fonction:
+                        fiche.fonction = poste[:200]; champs.append('fonction')
+                    if emploi:
+                        fiche.emploi = emploi[:200]; champs.append('emploi')
+                    if grade:
+                        fiche.grade = grade[:100]; champs.append('grade')
+                    if champs:
+                        fiche.save(update_fields=champs + ['updated_at'])
+            except Exception:
+                pass
+
+            # Agent (pointage) : renseigne le poste
+            try:
+                from .models import Agent
+                ag = getattr(user, 'agent_profile', None)
+                if ag is not None and poste and not ag.poste:
+                    ag.poste = poste[:100]
+                    ag.save(update_fields=['poste', 'updated_at'])
             except Exception:
                 pass
 
@@ -268,6 +347,7 @@ def import_users(rows, *, actor=None, request=None, dry_run=False):
         'erreurs': len(erreurs),
         'details_crees': crees,
         'details_erreurs': erreurs,
+        'roles_deduits': roles_deduits,
         'dry_run': dry_run,
     }
 
