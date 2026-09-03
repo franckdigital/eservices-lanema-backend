@@ -2,6 +2,7 @@ print("VIEWS.PY TOP LEVEL EXECUTED")
 import os
 print("VIEWS.PY CHARGÉ")
 import json
+import io
 import logging
 from django.conf import settings
 from django.http import HttpResponse, FileResponse
@@ -265,6 +266,55 @@ class UserViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         _audit_user_action(self.request, 'delete', instance, {})
         super().perform_destroy(instance)
+
+    @action(detail=False, methods=['get'], url_path='import-template')
+    def import_template(self, request):
+        """Télécharge un modèle de fichier d'import (CSV UTF-8)."""
+        from .user_import import CANON_HEADERS
+        import csv as _csv
+        buf = io.StringIO()
+        w = _csv.writer(buf, delimiter=';')
+        w.writerow(CANON_HEADERS)
+        w.writerow(['j.dupont', 'MotDePasse123', 'Jean', 'Dupont', 'j.dupont@lanema.ci',
+                    '+2250700000000', '', 'AGENT', '', '', 'Direction des Systèmes d\'Information - DSI',
+                    'Sous-Direction Support et Assistance', 'Service Support aux Utilisateurs', '', 'OUI'])
+        content = '﻿' + buf.getvalue()  # BOM pour Excel
+        resp = HttpResponse(content, content_type='text/csv; charset=utf-8')
+        resp['Content-Disposition'] = 'attachment; filename="modele_import_utilisateurs.csv"'
+        return resp
+
+    @action(detail=False, methods=['post'], url_path='import',
+            parser_classes=[MultiPartParser, FormParser])
+    def import_users(self, request):
+        """Import en masse depuis un fichier .xlsx ou .csv.
+        Params : file (obligatoire), dry_run=true|false (défaut false).
+        L'import est « tout ou rien » : si une ligne est en erreur, rien n'est créé.
+        """
+        from .user_import import parse_import_file, import_users as _run_import
+
+        f = request.FILES.get('file') or request.FILES.get('fichier')
+        if not f:
+            return Response({'detail': "Aucun fichier fourni (champ 'file')."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        dry_run = str(request.data.get('dry_run', '')).lower() in ('1', 'true', 'oui', 'yes')
+
+        try:
+            rows, warnings = parse_import_file(f)
+        except RuntimeError as e:
+            return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.exception("Echec de lecture du fichier d'import utilisateurs")
+            return Response({'detail': f"Fichier illisible : {e}"},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        if not rows:
+            return Response({'detail': 'Aucune ligne exploitable dans le fichier.',
+                             'warnings': warnings}, status=status.HTTP_400_BAD_REQUEST)
+
+        rapport = _run_import(rows, actor=request.user, request=request, dry_run=dry_run)
+        rapport['warnings'] = warnings
+        http_status = status.HTTP_200_OK if rapport['erreurs'] == 0 else status.HTTP_207_MULTI_STATUS
+        return Response(rapport, status=http_status)
 
     def get_queryset(self):
         print('UserViewSet: requête reçue, user =', self.request.user, 'is_authenticated =', self.request.user.is_authenticated)

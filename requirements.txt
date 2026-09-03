@@ -1,4 +1,6 @@
 Django>=5.2,<6.0
+# Import/export Excel (import en masse d'utilisateurs)
+openpyxl>=3.1.0
 PyMySQL>=1.0
 pytz
 python-dotenv
