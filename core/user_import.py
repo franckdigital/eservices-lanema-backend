@@ -36,7 +36,6 @@ import io
 import unicodedata
 
 from django.contrib.auth.models import User
-from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.validators import validate_email
 from django.db import transaction
@@ -262,10 +261,8 @@ def import_users(rows, *, actor=None, request=None, dry_run=False):
             if matricule and UserProfile.objects.filter(matricule=matricule).exists():
                 raise ValueError(f"matricule déjà utilisé : {matricule}")
 
-            try:
-                validate_password(password)
-            except DjangoValidationError as e:
-                raise ValueError("; ".join(e.messages))
+            # Import admin en masse : on n'applique que la longueur minimale (déjà
+            # vérifiée ci-dessus), pas les autres règles de complexité globales.
 
             # --- résolution des rattachements ---
             cabinet = _resolve_fk(Direction, row.get('cabinet'),

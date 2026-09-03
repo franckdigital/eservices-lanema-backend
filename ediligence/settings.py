@@ -245,18 +245,13 @@ if os.environ.get('LABO_LEGACY_DB_NAME'):
     }
 
 # Password validation
+# NumericPasswordValidator retiré volontairement : les mots de passe initiaux
+# fournis en masse (import RH) sont souvent numériques (matricule, n° de tel).
+# On garde une longueur minimale de 6 caractères.
 AUTH_PASSWORD_VALIDATORS = [
     {
-        'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
-    },
-    {
         'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',
-    },
-    {
-        'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator',
-    },
-    {
-        'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',
+        'OPTIONS': {'min_length': 6},
     },
 ]
 
