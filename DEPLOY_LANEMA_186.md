@@ -5,20 +5,20 @@
 | Backend  | `/var/www/lanema/backend` (repo `github.com/franckdigital/eservices-lanema-backend`) |
 | Frontend | `/var/www/lanema/frontend` |
 | venv | `/var/www/lanema/backend/venv` |
-| Projet Django | `ediligence` (`ediligence.settings`, `ediligence.wsgi`) |
+| Projet Django | `ediligence` — **Django 5.2 LTS** (épinglé : MySQL 8.0 ne supporte pas Django 6.x) |
 | App Celery | `ediligence` |
-| Fichier env | `/var/www/lanema/backend/.env` (chargé par systemd `EnvironmentFile`) |
+| Fichier env | `/var/www/lanema/backend/.env` (chargé par `settings.py` ET par systemd) |
 | Services systemd | `lanema` · `lanema-celery` · `lanema-celerybeat` |
 | Gunicorn | `127.0.0.1:9011` |
 | Broker | Redis `redis://localhost:6379/0` |
-| DB | MySQL 8 (Oracle) — base `lanema`, user `root`, mdp `Numerix@2026` |
-| phpMyAdmin | `https://pma.lanema-ci.com` |
-| PHP-FPM | `php8.3-fpm` (`/run/php/php8.3-fpm.sock`) |
+| DB | MySQL 8.0 (Ubuntu) — base `lanema`, user `root`, mdp `Numerix@2026`, plugin `caching_sha2_password` |
+| phpMyAdmin | `https://pma.lanema-ci.com` (déjà installé) |
+| PHP-FPM | `php8.3-fpm` |
 | Domaine API | `https://api.lanema-ci.com` |
 | Domaine Front | `https://e-services.lanema-ci.com` |
 
-> DNS requis (A record → 186.241.16.135) : `api.lanema-ci.com`,
-> `e-services.lanema-ci.com`, `pma.lanema-ci.com`.
+> DNS (A record → 186.241.16.135) requis : `api.lanema-ci.com`,
+> `e-services.lanema-ci.com` (`pma.lanema-ci.com` déjà fait).
 
 ---
 
@@ -26,9 +26,7 @@
 
 ```bash
 ssh root@186.241.16.135
-
 apt update && apt upgrade -y
-
 apt install -y \
   python3 python3-venv python3-dev python3-pip \
   build-essential cmake pkg-config \
@@ -37,8 +35,7 @@ apt install -y \
   tesseract-ocr poppler-utils \
   libjpeg-dev zlib1g-dev libpng-dev libgl1 libglib2.0-0
 ```
-
-(MySQL, PHP, Nginx, phpMyAdmin sont déjà installés.)
+(MySQL, PHP, Nginx, phpMyAdmin déjà installés.)
 
 ---
 
@@ -46,17 +43,15 @@ apt install -y \
 
 ```bash
 systemctl enable --now redis-server
-redis-cli ping        # -> PONG
+redis-cli ping                     # -> PONG
 ```
 
 ---
 
 ## Étape 3 — MySQL : mot de passe root + base
 
-Root doit accepter les connexions par mot de passe (pas `auth_socket`) :
-
 ```bash
-sudo mysql
+sudo mysql        # (ou: mysql -u root -p  si root a déjà un mot de passe)
 ```
 ```sql
 ALTER USER 'root'@'localhost' IDENTIFIED WITH caching_sha2_password BY 'Numerix@2026';
@@ -64,20 +59,11 @@ CREATE DATABASE IF NOT EXISTS lanema CHARACTER SET utf8mb4 COLLATE utf8mb4_unico
 FLUSH PRIVILEGES;
 EXIT;
 ```
-
 Vérif (TCP, comme Django) :
-
 ```bash
-mysql -u root -p'Numerix@2026' -h 127.0.0.1 -e "SELECT CURRENT_USER();"
+mysql -u root -p'Numerix@2026' -h 127.0.0.1 -e "SELECT VERSION(), CURRENT_USER();"
 ```
-
-Import d'un dump existant (optionnel) :
-
-```bash
-mysql -u root -p lanema < /root/backup_lanema.sql
-```
-
-> Désormais `sudo mysql` seul ne marche plus → `mysql -u root -p`.
+Import d'un dump éventuel : `mysql -u root -p lanema < /root/backup_lanema.sql`
 
 ---
 
@@ -98,15 +84,15 @@ cd /var/www/lanema/backend
 python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip wheel
-pip install -r requirements.txt
+pip install -r requirements.txt          # requirements.txt épingle Django>=5.2,<6.0
 pip install gunicorn
+
+python -m django --version               # doit afficher 5.2.x
 ```
 
 ---
 
 ## Étape 6 — Fichier `.env`
-
-Format systemd `EnvironmentFile` : `CLE=valeur`, sans quotes, sans `export`.
 
 ```bash
 cat > /var/www/lanema/backend/.env <<'EOF'
@@ -119,14 +105,11 @@ DB_PORT=3306
 CELERY_BROKER_URL=redis://localhost:6379/0
 CELERY_RESULT_BACKEND=redis://localhost:6379/0
 EOF
-
 chmod 600 /var/www/lanema/backend/.env
 ```
-
-> `settings.py` fait `load_dotenv('.env.local')` (no-op si absent) puis lit
-> `os.environ.get(...)` — les variables injectées par systemd depuis `.env`
-> sont donc bien prises en compte. `DB_HOST=127.0.0.1` (et non `localhost`)
-> pour forcer le TCP.
+> `settings.py` charge `.env.local` puis `.env` (via `is_file()`), donc
+> `manage.py` fonctionne sans `source .env`. Les services systemd lisent aussi
+> `.env` via `EnvironmentFile`.
 
 ---
 
@@ -134,8 +117,8 @@ chmod 600 /var/www/lanema/backend/.env
 
 ```bash
 cd /var/www/lanema/backend && source venv/bin/activate
-set -a; source .env; set +a          # charge .env dans le shell courant
 
+python manage.py makemigrations --check --dry-run
 python manage.py migrate
 python manage.py collectstatic --noinput
 python manage.py createsuperuser
@@ -146,7 +129,7 @@ mkdir -p /var/log/celery
 
 ---
 
-## Étape 8 — Service Gunicorn : `/etc/systemd/system/lanema.service`
+## Étape 8 — Service Gunicorn
 
 ```bash
 cat > /etc/systemd/system/lanema.service <<'EOF'
@@ -180,14 +163,12 @@ EOF
 systemctl daemon-reload
 systemctl enable --now lanema.service
 systemctl status lanema.service
-curl -I http://127.0.0.1:9011/admin/       # 301/302 attendu
+curl -I http://127.0.0.1:9011/admin/        # 301/302 attendu
 ```
 
 ---
 
-## Étape 9 — Celery
-
-### 9.1 Worker : `/etc/systemd/system/lanema-celery.service`
+## Étape 9 — Celery (worker + beat)
 
 ```bash
 cat > /etc/systemd/system/lanema-celery.service <<'EOF'
@@ -211,11 +192,7 @@ RestartSec=10s
 [Install]
 WantedBy=multi-user.target
 EOF
-```
 
-### 9.2 Beat : `/etc/systemd/system/lanema-celerybeat.service`
-
-```bash
 cat > /etc/systemd/system/lanema-celerybeat.service <<'EOF'
 [Unit]
 Description=Celery Beat — e-Services Lanema
@@ -240,30 +217,16 @@ RestartSec=10s
 [Install]
 WantedBy=multi-user.target
 EOF
-```
 
-### 9.3 Activation
-
-```bash
 systemctl daemon-reload
 systemctl enable --now lanema-celery.service lanema-celerybeat.service
 systemctl status lanema-celery lanema-celerybeat
 tail -n 30 /var/log/celery/lanema-worker.log
-tail -n 30 /var/log/celery/lanema-beat.log
 ```
 
-### 9.4 Tâches planifiées (`ediligence/celery.py`)
-
-| Tâche | Fréquence |
-|---|---|
-| `core.tasks_presence.check_agent_exits` | 5 min |
-| `core.tasks_presence.auto_close_forgotten_departures` | 17h00 |
-| `core.geofencing_tasks.check_geofence_violations` | 5 min |
-| `core.geofencing_tasks.cleanup_old_locations` | 02h00 |
-| `core.geofencing_tasks.cleanup_old_alerts` | lundi 03h00 |
-| `core.geofencing_tasks.generate_geofence_report` | 18h00 |
-| `core.tasks_scanner.watch_scan_folder` | 30 s |
-| `dfir_email.tasks.sync_tous_comptes_email_dfir` | 5 min |
+Tâches planifiées (`ediligence/celery.py`) : présence (5 min), fermeture auto 17h,
+geofencing (5 min), nettoyages 02h/03h, rapport 18h, `watch_scan_folder` (30 s),
+sync email DFIR (5 min).
 
 ---
 
@@ -291,6 +254,7 @@ server {
 EOF
 
 ln -sf /etc/nginx/sites-available/lanema /etc/nginx/sites-enabled/lanema
+rm -f /etc/nginx/sites-enabled/default
 nginx -t && systemctl reload nginx
 ```
 
@@ -317,19 +281,16 @@ certbot --nginx \
   -d e-services.lanema-ci.com \
   --non-interactive --agree-tos -m franckalain.ai@gmail.com --redirect
 
-ls /etc/letsencrypt/live/          # noter le nom du dossier créé
+ls /etc/letsencrypt/live/          # noter le nom du dossier (ex: api.lanema-ci.com)
 ```
 
 ---
 
 ## Étape 13 — Nginx : config finale
 
-Adapter le chemin `ssl_certificate` au dossier vu à l'étape 12
-(ex. `api.lanema-ci.com`).
-
 ```bash
 cat > /etc/nginx/sites-available/lanema <<'EOF'
-# HTTP -> HTTPS
+# ===== HTTP -> HTTPS =====
 server {
     listen 80;
     server_name api.lanema-ci.com e-services.lanema-ci.com;
@@ -337,7 +298,7 @@ server {
     location / { return 301 https://$host$request_uri; }
 }
 
-# Frontend
+# ===== FRONTEND : e-services.lanema-ci.com =====
 server {
     listen 443 ssl http2;
     server_name e-services.lanema-ci.com;
@@ -359,7 +320,7 @@ server {
     location / { try_files $uri $uri/ /index.html; }
 }
 
-# API
+# ===== API : api.lanema-ci.com =====
 server {
     listen 443 ssl http2;
     server_name api.lanema-ci.com;
@@ -374,6 +335,7 @@ server {
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
     add_header X-Frame-Options DENY always;
     add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 
     location /static/ {
         alias /var/www/lanema/backend/static/;
@@ -392,6 +354,8 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Port 443;
         proxy_read_timeout 120s;
     }
 }
@@ -399,6 +363,9 @@ EOF
 
 nginx -t && systemctl reload nginx
 ```
+
+> Adapter `api.lanema-ci.com` dans les chemins `ssl_certificate` au nom réel du
+> dossier vu à l'étape 12.
 
 ---
 
@@ -419,7 +386,6 @@ git clone <REPO_FRONTEND> frontend
 cd frontend
 npm ci
 npm run build
-# servir le build depuis /var/www/lanema/frontend (root du vhost)
 # si le build sort dans dist/ :  rsync -a --delete dist/ /var/www/lanema/frontend/
 ```
 
@@ -476,4 +442,18 @@ journalctl -u lanema -f
 tail -f /var/log/celery/lanema-worker.log
 tail -f /var/log/celery/lanema-beat.log
 tail -f /var/www/lanema/backend/logs/error.log
+```
+
+---
+
+## Notes / pièges rencontrés
+
+- **`.env` vs `.env.local`** : `settings.py` a été modifié pour charger `.env`
+  (via `is_file()`, pour ne pas confondre avec le dossier venv `backend/.env/`).
+- **root MySQL en `auth_socket`** → provoque `ERROR 1698` / `1045` en TCP.
+  Corrigé par `ALTER USER ... IDENTIFIED WITH caching_sha2_password`.
+- **Django 6.x exige MySQL ≥ 8.4** (`NotSupportedError`). MySQL 8.0 d'Ubuntu →
+  Django épinglé à `>=5.2,<6.0` dans `requirements.txt` (5.2 LTS, support 2028).
+- **Dépôt APT MySQL Oracle** : clé GPG expirée (`EXPKEYSIG`). Non utilisé —
+  on reste sur le paquet MySQL 8.0 d'Ubuntu (patché jusqu'en 2029).
 ```
