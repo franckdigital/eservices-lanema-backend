@@ -274,7 +274,7 @@ LOGGING = {
         'core': {
             'handlers': ['console'],
             'level': 'INFO',
-            'propagate': True,
+            'propagate': False,  # évite le doublon (handler console + propagation au root)
         },
         '': {  # root logger
             'handlers': ['console'],
