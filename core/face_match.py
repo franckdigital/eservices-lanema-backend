@@ -57,3 +57,28 @@ def compare_faces(reference_field, captured_field, tolerance=DEFAULT_TOLERANCE):
 
     distance = float(face_recognition.face_distance([reference_encodings[0]], captured_encodings[0])[0])
     return {'matched': distance <= tolerance, 'distance': distance, 'error': None, 'stage': None}
+
+
+def extract_single_face(image_field):
+    """Vérifie qu'une image contient exactement un visage détectable — utilisé
+    pour n'accepter comme NOUVELLE photo de référence (bootstrap d'une fiche
+    agent qui n'en a pas encore) qu'une capture exploitable. Ne lève jamais
+    d'exception, comme compare_faces."""
+    try:
+        import face_recognition
+    except ImportError:
+        return {'ok': False, 'error': 'moteur de reconnaissance faciale indisponible'}
+
+    try:
+        image_field.seek(0)
+        image = face_recognition.load_image_file(image_field)
+        encodings = face_recognition.face_encodings(image)
+    except Exception:
+        logger.exception('[face_match] échec lecture/encodage photo (extraction visage unique)')
+        return {'ok': False, 'error': 'photo illisible'}
+
+    if not encodings:
+        return {'ok': False, 'error': 'aucun visage détecté'}
+    if len(encodings) > 1:
+        return {'ok': False, 'error': f'{len(encodings)} visages détectés'}
+    return {'ok': True, 'error': None}

@@ -2299,6 +2299,9 @@ class ProxyPresenceView(APIView):
         # une, cf. confirm.tsx / [ficheAgentId].tsx) — mais dès qu'une photo
         # de référence existe, on exige un résultat de comparaison exploitable.
         face_match_distance = None
+        # Capturé avant l'éventuel auto-enrôlement ci-dessous, pour que
+        # l'audit reflète l'état réel au moment de CE pointage.
+        had_no_reference_photo = not bool(fiche_agent.photo)
         if fiche_agent.photo:
             from .face_match import compare_faces
             match_result = compare_faces(fiche_agent.photo, verification_photo)
@@ -2325,6 +2328,34 @@ class ProxyPresenceView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
             face_match_distance = match_result['distance']
+        else:
+            # Aucune photo de référence pour cette fiche : on établit
+            # automatiquement la référence à partir de CETTE capture (si elle
+            # contient bien un visage net et unique), pour qu'à partir du
+            # PROCHAIN pointage de cet agent la comparaison faciale
+            # s'applique réellement — sans attendre une saisie RH séparée
+            # qui peut ne jamais arriver. Réduit la fenêtre d'usurpation
+            # possible à un seul pointage par agent au lieu de zéro protection
+            # tant que personne n'a pensé à ajouter sa photo.
+            from .face_match import extract_single_face
+            check = extract_single_face(verification_photo)
+            if check['ok']:
+                verification_photo.seek(0)
+                fiche_agent.photo.save(
+                    f"auto_ref_{fiche_agent.id}.jpg", verification_photo, save=True,
+                )
+                logger.info(
+                    '[ProxyPresenceView] Photo de référence établie automatiquement pour '
+                    'fiche_agent=%s (%s) à partir du pointage assisté du %s',
+                    fiche_agent.id, fiche_agent.matricule, timezone.now().date(),
+                )
+            else:
+                logger.warning(
+                    '[ProxyPresenceView] Photo capturée inexploitable comme référence pour '
+                    'fiche_agent=%s (%s) : %s — pointage accepté sans photo de référence '
+                    '(comme avant), réessayer au prochain pointage.',
+                    fiche_agent.id, fiche_agent.matricule, check['error'],
+                )
 
         agent_obj = None
         if fiche_agent.user_id:
@@ -2358,7 +2389,7 @@ class ProxyPresenceView(APIView):
                 # sur Presence dans core/models.py.
                 'liveness_passed': liveness_passed,
                 'liveness_method': liveness_method,
-                'reference_photo_absente': not bool(fiche_agent.photo),
+                'reference_photo_absente': had_no_reference_photo,
                 'face_match_distance': face_match_distance,
             },
         )
@@ -2404,7 +2435,7 @@ class ProxyPresenceView(APIView):
         presence.verification_method = verification_method
         presence.liveness_passed = liveness_passed
         presence.liveness_method = liveness_method
-        presence.reference_photo_absente = not bool(fiche_agent.photo)
+        presence.reference_photo_absente = had_no_reference_photo
         presence.face_match_distance = face_match_distance
         presence.save()
 
