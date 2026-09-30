@@ -12,6 +12,32 @@ logger = logging.getLogger(__name__)
 # considérés comme la même personne.
 DEFAULT_TOLERANCE = 0.6
 
+# Plus grand côté (px) auquel une image est ramenée avant toute détection de
+# visage. La détection HOG de dlib est ~proportionnelle au nombre de pixels :
+# une photo de téléphone (souvent 3000-4000 px) peut prendre plusieurs
+# secondes à traiter sans ce redimensionnement, pour un gain de précision nul
+# à cette taille (un visage cadré dans le cercle de guidage reste net à
+# 640 px) — c'est la cause principale de la lenteur ressentie à la capture.
+MAX_IMAGE_DIM = 640
+
+
+def _load_image_array(image_field):
+    """Charge une image (ImageField/UploadedFile) et la redimensionne avant
+    tout traitement facial — voir MAX_IMAGE_DIM. Remplace
+    face_recognition.load_image_file() partout dans ce module."""
+    from PIL import Image, ImageOps
+    import numpy as np
+
+    image_field.seek(0)
+    img = Image.open(image_field)
+    img = ImageOps.exif_transpose(img)  # respecte l'orientation EXIF (photo prise en portrait)
+    img = img.convert('RGB')
+    w, h = img.size
+    if max(w, h) > MAX_IMAGE_DIM:
+        scale = MAX_IMAGE_DIM / max(w, h)
+        img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
+    return np.array(img)
+
 
 def compare_faces(reference_field, captured_field, tolerance=DEFAULT_TOLERANCE):
     """Compare le visage de deux ImageField (FicheAgent.photo vs photo de
@@ -35,7 +61,7 @@ def compare_faces(reference_field, captured_field, tolerance=DEFAULT_TOLERANCE):
 
     try:
         reference_field.seek(0)
-        reference_image = face_recognition.load_image_file(reference_field)
+        reference_image = _load_image_array(reference_field)
         reference_encodings = face_recognition.face_encodings(reference_image)
     except Exception:
         logger.exception('[face_match] échec lecture/encodage photo de référence')
@@ -46,7 +72,7 @@ def compare_faces(reference_field, captured_field, tolerance=DEFAULT_TOLERANCE):
 
     try:
         captured_field.seek(0)
-        captured_image = face_recognition.load_image_file(captured_field)
+        captured_image = _load_image_array(captured_field)
         captured_encodings = face_recognition.face_encodings(captured_image)
     except Exception:
         logger.exception('[face_match] échec lecture/encodage photo capturée')
@@ -74,7 +100,7 @@ def extract_single_face(image_field):
 
     try:
         image_field.seek(0)
-        image = face_recognition.load_image_file(image_field)
+        image = _load_image_array(image_field)
         encodings = face_recognition.face_encodings(image)
     except Exception:
         logger.exception('[face_match] échec lecture/encodage photo (extraction visage unique)')
@@ -112,7 +138,7 @@ def identify_face(captured_field, known_encodings, known_ids, tolerance=DEFAULT_
 
     try:
         captured_field.seek(0)
-        captured_image = face_recognition.load_image_file(captured_field)
+        captured_image = _load_image_array(captured_field)
         captured_encodings = face_recognition.face_encodings(captured_image)
     except Exception:
         logger.exception('[face_match] échec lecture/encodage photo capturée (identification)')
