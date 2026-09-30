@@ -506,7 +506,6 @@ class PresenceSerializer(serializers.ModelSerializer):
     fiche_agent = serializers.PrimaryKeyRelatedField(read_only=True)
     enregistre_par = serializers.PrimaryKeyRelatedField(read_only=True)
     enregistre_par_info = serializers.SerializerMethodField()
-    verification_photo_url = serializers.SerializerMethodField()
     fiche_agent_photo_url = serializers.SerializerMethodField()
 
     class Meta:
@@ -518,7 +517,7 @@ class PresenceSerializer(serializers.ModelSerializer):
             'derniere_latitude_connue', 'derniere_longitude_connue',
             'commentaire', 'created_at', 'updated_at',
             'fiche_agent', 'enregistre_par', 'enregistre_par_info', 'verification_method',
-            'verification_photo_url', 'fiche_agent_photo_url', 'liveness_passed',
+            'fiche_agent_photo_url', 'liveness_passed',
             'liveness_method', 'reference_photo_absente', 'face_match_distance',
         ]
         read_only_fields = ['id', 'agent', 'created_at', 'updated_at', 'localisation_valide']
@@ -528,13 +527,6 @@ class PresenceSerializer(serializers.ModelSerializer):
             return None
         from .serializers_rh import UserBriefSerializer
         return UserBriefSerializer(obj.enregistre_par).data
-
-    def get_verification_photo_url(self, obj):
-        if obj.verification_photo:
-            request = self.context.get('request')
-            if request:
-                return request.build_absolute_uri(obj.verification_photo.url)
-        return None
 
     def get_fiche_agent_photo_url(self, obj):
         fiche = obj.fiche_agent

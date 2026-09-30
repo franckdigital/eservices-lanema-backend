@@ -2283,21 +2283,43 @@ class ProxyPresenceView(APIView):
 
         # Comparaison faciale automatique contre la photo de référence RH —
         # c'est le vrai rempart contre un collègue qui pointerait à la place
-        # de l'agent avec n'importe quelle photo. Un souci côté photo de
-        # référence (absente/illisible/sans visage — pas la faute de l'agent)
-        # laisse passer le pointage en vérification manuelle, comme avant ;
-        # un souci côté photo capturée à l'instant, ou une identité qui ne
-        # correspond pas, bloque — l'agent/secrétaire peut reprendre la photo.
+        # de l'agent avec n'importe quelle photo.
+        #
+        # Politique "fail closed" : TOUT cas où la comparaison ne peut pas
+        # être menée à son terme (moteur face_recognition/dlib indisponible,
+        # photo de référence illisible/sans visage, photo capturée
+        # illisible/sans visage) BLOQUE désormais le pointage, au lieu de le
+        # laisser passer en "vérification manuelle" silencieuse — c'est cette
+        # ancienne tolérance qui permettait à n'importe quel agent de se
+        # faire pointer par un collègue dès que la comparaison échouait pour
+        # une raison technique (notamment si le moteur n'est pas installé
+        # côté serveur, cf. requirements.txt: face_recognition + dlib).
+        # Seul le cas où la fiche agent n'a ENCORE aucune photo de référence
+        # du tout reste volontairement permissif (l'UI pousse à en ajouter
+        # une, cf. confirm.tsx / [ficheAgentId].tsx) — mais dès qu'une photo
+        # de référence existe, on exige un résultat de comparaison exploitable.
         face_match_distance = None
         if fiche_agent.photo:
             from .face_match import compare_faces
             match_result = compare_faces(fiche_agent.photo, verification_photo)
-            if match_result['stage'] == 'captured':
-                return Response(
-                    {'error': f"Vérification faciale impossible : {match_result['error']}. Reprenez la photo."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            if match_result['stage'] is None and not match_result['matched']:
+            if match_result['matched'] is None:
+                if match_result['stage'] == 'reference':
+                    logger.critical(
+                        "[ProxyPresenceView] Comparaison faciale impossible côté RÉFÉRENCE pour "
+                        "fiche_agent=%s (%s) : %s — pointage bloqué. Si ceci se produit pour TOUS "
+                        "les agents, le moteur face_recognition/dlib n'est probablement pas "
+                        "installé côté serveur (voir DEPLOY / requirements.txt).",
+                        fiche_agent.id, fiche_agent.matricule, match_result['error'],
+                    )
+                    message = (
+                        "Vérification faciale impossible : la photo de référence de cet agent "
+                        f"pose problème ({match_result['error']}). Un administrateur doit la "
+                        "remplacer (fiche RH de l'agent) avant de pouvoir pointer cet agent."
+                    )
+                else:
+                    message = f"Vérification faciale impossible : {match_result['error']}. Reprenez la photo."
+                return Response({'error': message}, status=status.HTTP_400_BAD_REQUEST)
+            if not match_result['matched']:
                 return Response(
                     {'error': "Le visage sur la photo ne correspond pas à la photo de référence de cet agent. Pointage refusé."},
                     status=status.HTTP_400_BAD_REQUEST,
@@ -2332,7 +2354,8 @@ class ProxyPresenceView(APIView):
                 'device_fingerprint': device_fingerprint,
                 'enregistre_par': request.user,
                 'verification_method': verification_method,
-                'verification_photo': verification_photo,
+                # Pas de sauvegarde de la photo capturée : voir commentaire
+                # sur Presence dans core/models.py.
                 'liveness_passed': liveness_passed,
                 'liveness_method': liveness_method,
                 'reference_photo_absente': not bool(fiche_agent.photo),
@@ -2379,7 +2402,6 @@ class ProxyPresenceView(APIView):
         presence.device_fingerprint = device_fingerprint
         presence.enregistre_par = request.user
         presence.verification_method = verification_method
-        presence.verification_photo = verification_photo
         presence.liveness_passed = liveness_passed
         presence.liveness_method = liveness_method
         presence.reference_photo_absente = not bool(fiche_agent.photo)

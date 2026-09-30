@@ -1123,7 +1123,11 @@ class Presence(models.Model):
         ('proxy_manual', 'Assiste — sans photo'),
     ]
     verification_method = models.CharField(max_length=20, choices=VERIFICATION_METHOD_CHOICES, default='self')
-    verification_photo = models.ImageField(upload_to='presences/verification/', null=True, blank=True)
+    # Volontairement PAS de champ photo ici : la photo capturée lors d'un
+    # pointage assisté ne sert qu'à la comparaison faciale en mémoire
+    # (core.face_match.compare_faces) et n'est jamais écrite sur disque/BD —
+    # seul le résultat (face_match_distance ci-dessous) est conservé comme
+    # preuve d'audit, jamais l'image du visage de l'agent.
     liveness_passed = models.BooleanField(
         null=True, blank=True,
         help_text="Null = non applicable (auto-pointage ou pointage assiste sans photo)"
