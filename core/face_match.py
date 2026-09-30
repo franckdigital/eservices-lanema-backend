@@ -13,14 +13,13 @@ logger = logging.getLogger(__name__)
 DEFAULT_TOLERANCE = 0.6
 
 # Plus grand côté (px) auquel une image est ramenée avant toute détection de
-# visage. La détection HOG de dlib est ~proportionnelle au nombre de pixels :
-# une photo de téléphone (souvent 3000-4000 px) peut prendre plusieurs
-# secondes à traiter sans ce redimensionnement. 720 px est un compromis :
-# assez petit pour rester rapide, assez grand pour ne pas perdre les visages
-# photographiés à distance normale (pointage assisté, pas un selfie collé à
-# l'objectif) — 640 px s'est révélé trop agressif (faux "aucun visage
-# détecté" sur des visages réels mais un peu petits/éloignés dans le cadre).
-MAX_IMAGE_DIM = 720
+# visage. La détection HOG de dlib est ~proportionnelle au nombre de pixels.
+# Descendu à 480 (depuis 720) car _detect_encodings() fait maintenant 2
+# passes : une rapide à cette taille, et SEULEMENT si elle échoue, une 2e
+# passe plus sensible (upsample x2) avant de conclure à l'échec — donc la
+# sensibilité aux visages petits/éloignés est compensée par le fallback,
+# sans payer son coût sur le cas normal (la grande majorité des captures).
+MAX_IMAGE_DIM = 480
 
 
 def _load_image_array(image_field):
