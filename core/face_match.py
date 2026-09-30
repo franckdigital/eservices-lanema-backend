@@ -15,16 +15,17 @@ DEFAULT_TOLERANCE = 0.6
 # Plus grand côté (px) auquel une image est ramenée avant toute détection de
 # visage. La détection HOG de dlib est ~proportionnelle au nombre de pixels :
 # une photo de téléphone (souvent 3000-4000 px) peut prendre plusieurs
-# secondes à traiter sans ce redimensionnement, pour un gain de précision nul
-# à cette taille (un visage cadré dans le cercle de guidage reste net à
-# 640 px) — c'est la cause principale de la lenteur ressentie à la capture.
-MAX_IMAGE_DIM = 640
+# secondes à traiter sans ce redimensionnement. 720 px est un compromis :
+# assez petit pour rester rapide, assez grand pour ne pas perdre les visages
+# photographiés à distance normale (pointage assisté, pas un selfie collé à
+# l'objectif) — 640 px s'est révélé trop agressif (faux "aucun visage
+# détecté" sur des visages réels mais un peu petits/éloignés dans le cadre).
+MAX_IMAGE_DIM = 720
 
 
 def _load_image_array(image_field):
     """Charge une image (ImageField/UploadedFile) et la redimensionne avant
-    tout traitement facial — voir MAX_IMAGE_DIM. Remplace
-    face_recognition.load_image_file() partout dans ce module."""
+    tout traitement facial — voir MAX_IMAGE_DIM."""
     from PIL import Image, ImageOps
     import numpy as np
 
@@ -39,9 +40,29 @@ def _load_image_array(image_field):
     return np.array(img)
 
 
+def _detect_encodings(image_array):
+    """Détecte et encode les visages d'une image, en 2 passes :
+    1) détection rapide (HOG, upsample=1) — le cas normal, quasi instantané.
+    2) SEULEMENT si la passe 1 n'a rien trouvé : nouvelle tentative plus
+       sensible (upsample=2) avant de conclure "aucun visage" — récupère les
+       visages un peu petits/éloignés/mal cadrés sans ralentir le cas normal
+       (l'écrasante majorité des captures), puisque la passe 2 ne se
+       déclenche que sur échec de la passe 1."""
+    import face_recognition
+
+    locations = face_recognition.face_locations(image_array)  # HOG, upsample=1 (rapide)
+    if not locations:
+        locations = face_recognition.face_locations(image_array, number_of_times_to_upsample=2)
+    if not locations:
+        return []
+    return face_recognition.face_encodings(image_array, known_face_locations=locations)
+
+
 def compare_faces(reference_field, captured_field, tolerance=DEFAULT_TOLERANCE):
     """Compare le visage de deux ImageField (FicheAgent.photo vs photo de
-    vérification du pointage). Retourne un dict :
+    vérification du pointage) en redécodant et ré-encodant les DEUX images.
+    Préférer compare_faces_with_cache() quand un FicheAgent est disponible
+    (évite de redécoder la photo de référence à chaque pointage). Retourne :
         matched: bool | None (None si comparaison impossible)
         distance: float | None
         error: str | None (raison lisible si matched est None)
@@ -60,9 +81,8 @@ def compare_faces(reference_field, captured_field, tolerance=DEFAULT_TOLERANCE):
         return {'matched': None, 'distance': None, 'error': 'moteur de reconnaissance faciale indisponible', 'stage': 'reference'}
 
     try:
-        reference_field.seek(0)
         reference_image = _load_image_array(reference_field)
-        reference_encodings = face_recognition.face_encodings(reference_image)
+        reference_encodings = _detect_encodings(reference_image)
     except Exception:
         logger.exception('[face_match] échec lecture/encodage photo de référence')
         return {'matched': None, 'distance': None, 'error': 'photo de référence illisible', 'stage': 'reference'}
@@ -71,9 +91,8 @@ def compare_faces(reference_field, captured_field, tolerance=DEFAULT_TOLERANCE):
         return {'matched': None, 'distance': None, 'error': 'aucun visage détecté sur la photo de référence', 'stage': 'reference'}
 
     try:
-        captured_field.seek(0)
         captured_image = _load_image_array(captured_field)
-        captured_encodings = face_recognition.face_encodings(captured_image)
+        captured_encodings = _detect_encodings(captured_image)
     except Exception:
         logger.exception('[face_match] échec lecture/encodage photo capturée')
         return {'matched': None, 'distance': None, 'error': 'photo capturée illisible', 'stage': 'captured'}
@@ -82,6 +101,39 @@ def compare_faces(reference_field, captured_field, tolerance=DEFAULT_TOLERANCE):
         return {'matched': None, 'distance': None, 'error': 'aucun visage détecté sur la photo capturée', 'stage': 'captured'}
 
     distance = float(face_recognition.face_distance([reference_encodings[0]], captured_encodings[0])[0])
+    return {'matched': distance <= tolerance, 'distance': distance, 'error': None, 'stage': None}
+
+
+def compare_faces_with_cache(fiche_agent, captured_field, tolerance=DEFAULT_TOLERANCE):
+    """Comme compare_faces, mais réutilise fiche_agent.face_encoding (calculé
+    une fois pour toutes à l'enregistrement de la photo de référence) au lieu
+    de redécoder ET ré-encoder cette photo à CHAQUE pointage — évite la
+    moitié du travail (un seul visage à détecter/encoder : le capturé),
+    optimisation principale pour la lenteur ressentie sur ProxyPresenceView.
+    Retombe sur compare_faces() (recalcul complet) si le cache est absent
+    (photo ajoutée avant ce cache, ou échec d'encodage précédent)."""
+    try:
+        import face_recognition
+    except ImportError:
+        logger.error('[face_match] face_recognition non installé — comparaison ignorée')
+        return {'matched': None, 'distance': None, 'error': 'moteur de reconnaissance faciale indisponible', 'stage': 'reference'}
+
+    reference_encoding = getattr(fiche_agent, 'face_encoding', None)
+    if not reference_encoding:
+        return compare_faces(fiche_agent.photo, captured_field, tolerance)
+
+    try:
+        captured_image = _load_image_array(captured_field)
+        captured_encodings = _detect_encodings(captured_image)
+    except Exception:
+        logger.exception('[face_match] échec lecture/encodage photo capturée')
+        return {'matched': None, 'distance': None, 'error': 'photo capturée illisible', 'stage': 'captured'}
+
+    if not captured_encodings:
+        return {'matched': None, 'distance': None, 'error': 'aucun visage détecté sur la photo capturée', 'stage': 'captured'}
+
+    import numpy as np
+    distance = float(face_recognition.face_distance([np.array(reference_encoding)], captured_encodings[0])[0])
     return {'matched': distance <= tolerance, 'distance': distance, 'error': None, 'stage': None}
 
 
@@ -94,14 +146,13 @@ def extract_single_face(image_field):
     Retourne {'ok': bool, 'error': str|None, 'encoding': list[float]|None}.
     """
     try:
-        import face_recognition
+        import face_recognition  # noqa: F401  (juste pour détecter l'absence du moteur)
     except ImportError:
         return {'ok': False, 'error': 'moteur de reconnaissance faciale indisponible', 'encoding': None}
 
     try:
-        image_field.seek(0)
         image = _load_image_array(image_field)
-        encodings = face_recognition.face_encodings(image)
+        encodings = _detect_encodings(image)
     except Exception:
         logger.exception('[face_match] échec lecture/encodage photo (extraction visage unique)')
         return {'ok': False, 'error': 'photo illisible', 'encoding': None}
@@ -122,8 +173,7 @@ IDENTIFY_MARGIN = 0.08
 def identify_face(captured_field, known_encodings, known_ids, tolerance=DEFAULT_TOLERANCE, margin=IDENTIFY_MARGIN):
     """Identification 1:N : compare le visage capturé à une liste d'encodages
     déjà en cache (FicheAgent.face_encoding), sans redécoder aucune photo de
-    référence. `known_encodings`/`known_ids` doivent être alignés (même index
-    = même agent). Retourne :
+    référence — seule la photo capturée est décodée/encodée ici. Retourne :
         status: 'matched' | 'no_match' | 'ambiguous' | 'error'
         fiche_agent_id: int | None
         distance: float | None
@@ -137,9 +187,8 @@ def identify_face(captured_field, known_encodings, known_ids, tolerance=DEFAULT_
                 'error': 'moteur de reconnaissance faciale indisponible'}
 
     try:
-        captured_field.seek(0)
         captured_image = _load_image_array(captured_field)
-        captured_encodings = face_recognition.face_encodings(captured_image)
+        captured_encodings = _detect_encodings(captured_image)
     except Exception:
         logger.exception('[face_match] échec lecture/encodage photo capturée (identification)')
         return {'status': 'error', 'fiche_agent_id': None, 'distance': None, 'error': 'photo illisible'}

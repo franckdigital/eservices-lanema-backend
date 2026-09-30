@@ -2391,8 +2391,8 @@ class ProxyPresenceView(APIView):
         # l'audit reflète l'état réel au moment de CE pointage.
         had_no_reference_photo = not bool(fiche_agent.photo)
         if fiche_agent.photo:
-            from .face_match import compare_faces
-            match_result = compare_faces(fiche_agent.photo, verification_photo)
+            from .face_match import compare_faces_with_cache
+            match_result = compare_faces_with_cache(fiche_agent, verification_photo)
             if match_result['matched'] is None:
                 if match_result['stage'] == 'reference':
                     logger.critical(
