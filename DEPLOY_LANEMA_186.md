@@ -456,4 +456,16 @@ tail -f /var/www/lanema/backend/logs/error.log
   Django épinglé à `>=5.2,<6.0` dans `requirements.txt` (5.2 LTS, support 2028).
 - **Dépôt APT MySQL Oracle** : clé GPG expirée (`EXPKEYSIG`). Non utilisé —
   on reste sur le paquet MySQL 8.0 d'Ubuntu (patché jusqu'en 2029).
+- **`face_recognition_models` cassé silencieusement** : dépend de
+  `pkg_resources`, retiré de `setuptools>=81` (nov. 2025). Sans ça,
+  `import face_recognition` échoue → la comparaison faciale du pointage
+  assisté (`ProxyPresenceView`) tombait en "moteur indisponible" et, avant
+  le correctif fail-closed, laissait passer **tous** les pointages sans
+  vérification. Fix : `pip install "setuptools<81" face_recognition_models`
+  — épinglé dans `requirements.txt`. Vérifier après toute réinstallation :
+  ```bash
+  python -c "import face_recognition, numpy as np; \
+    print(face_recognition.face_encodings(np.zeros((100,100,3),dtype='uint8')))"
+  ```
+  Doit afficher `[]` sans `ModuleNotFoundError`/`Please install face_recognition_models`.
 ```
