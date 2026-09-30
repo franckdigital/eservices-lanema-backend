@@ -29,7 +29,10 @@ class FicheAgentSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = FicheAgent
-        fields = '__all__'
+        # face_encoding : vecteur 128-d interne (cache d'identification faciale),
+        # jamais exposé à l'API — inutile côté client et évite d'alourdir
+        # chaque réponse liste/détail avec ~1 Ko de floats par agent.
+        exclude = ['face_encoding']
 
     def get_photo_url(self, obj):
         if obj.photo:

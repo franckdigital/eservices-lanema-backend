@@ -2252,6 +2252,11 @@ class FicheAgent(models.Model):
     nom = models.CharField(max_length=100)
     prenoms = models.CharField(max_length=200)
     photo = models.ImageField(upload_to='rh/agents/photos/', null=True, blank=True)
+    # Encodage facial (vecteur 128-d, face_recognition) mis en cache à chaque
+    # (ré)enregistrement de `photo` — voir core.views._sync_face_encoding.
+    # Sert à l'identification 1:N (photo capturée -> quel agent ?) sans
+    # redécoder toutes les photos de référence à chaque pointage assisté.
+    face_encoding = models.JSONField(null=True, blank=True)
     grade = models.CharField(max_length=100, blank=True)
     emploi = models.CharField(max_length=200, blank=True)
     fonction = models.CharField(max_length=200, blank=True)

@@ -9,7 +9,7 @@ from .views import (
     UserDiligenceCommentViewSet, UserDiligenceInstructionViewSet,
     DemandeCongeViewSet, DemandeAbsenceViewSet, UpdatePresenceStatusView, DeleteUserView,
     CustomTokenObtainPairView, MaPresenceDuJourView, MesPresencesView, SimplePresenceView, PresenceSyncView, AgentRegistrationView,
-    ProxyPresenceView,
+    ProxyPresenceView, IdentifyAgentView,
     DiligenceDownloadFichierView, OccurrenceSpecialeViewSet, SiteViewSet, SitePalierViewSet,
     CourrierInstructionViewSet, CourrierAnnexeViewSet, PresenceSummaryView,
     UserAuditLogViewSet
@@ -134,6 +134,7 @@ urlpatterns = [
     path('presence/simple/', SimplePresenceView.as_view(), name='simple-presence'),
     path('presence/sync/', PresenceSyncView.as_view(), name='presence-sync'),
     path('presence/proxy/', ProxyPresenceView.as_view(), name='presence-proxy'),
+    path('presence/identify/', IdentifyAgentView.as_view(), name='presence-identify'),
     path('presence/<int:presence_id>/update-status/', UpdatePresenceStatusView.as_view(), name='update-presence-status'),
     path('stats/presence/', PresenceStatsAPIView.as_view(), name='presence-stats'),
     path('presences/summary/',  PresenceSummaryView.as_view(),  name='presence-summary'),

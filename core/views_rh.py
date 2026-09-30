@@ -69,6 +69,16 @@ class FicheAgentViewSet(viewsets.ModelViewSet):
             qs = qs.filter(service_id=service)
         return qs
 
+    def perform_create(self, serializer):
+        instance = serializer.save()
+        from .views import sync_face_encoding
+        sync_face_encoding(instance)
+
+    def perform_update(self, serializer):
+        instance = serializer.save()
+        from .views import sync_face_encoding
+        sync_face_encoding(instance)
+
     @action(detail=False, methods=['get'])
     def stats(self, request):
         qs = FicheAgent.objects.all()

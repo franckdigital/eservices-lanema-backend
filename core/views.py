@@ -151,6 +151,34 @@ def _sync_fiche_agent_for_user(user):
     return fiche
 
 
+def sync_face_encoding(fiche_agent):
+    """(Ré)encode FicheAgent.photo et met en cache le résultat dans
+    face_encoding — à appeler après tout enregistrement d'une nouvelle photo
+    de référence (upload RH, ou auto-enrôlement dans ProxyPresenceView).
+    Best-effort : ne lève jamais, se contente de logger en cas d'échec."""
+    if not fiche_agent.photo:
+        if fiche_agent.face_encoding is not None:
+            FicheAgentModel = fiche_agent.__class__
+            FicheAgentModel.objects.filter(pk=fiche_agent.pk).update(face_encoding=None)
+            fiche_agent.face_encoding = None
+        return
+    try:
+        from .face_match import extract_single_face
+        result = extract_single_face(fiche_agent.photo)
+        encoding = result['encoding'] if result['ok'] else None
+        if not result['ok']:
+            logger.warning(
+                "[sync_face_encoding] Photo de référence de fiche_agent=%s (%s) inexploitable : %s "
+                "— identification/vérification faciale désactivée pour cet agent tant qu'elle n'est pas remplacée.",
+                fiche_agent.id, fiche_agent.matricule, result['error'],
+            )
+        FicheAgentModel = fiche_agent.__class__
+        FicheAgentModel.objects.filter(pk=fiche_agent.pk).update(face_encoding=encoding)
+        fiche_agent.face_encoding = encoding
+    except Exception:
+        logger.exception("[sync_face_encoding] Echec pour fiche_agent=%s", getattr(fiche_agent, 'id', '?'))
+
+
 def _client_ip(request):
     xff = request.META.get('HTTP_X_FORWARDED_FOR', '')
     if xff:
@@ -2227,6 +2255,66 @@ class UpdatePresenceStatusView(APIView):
             logger.error(f'[UpdatePresenceStatus] Erreur: {str(e)}')
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
+class IdentifyAgentView(APIView):
+    """Identification 1:N pour le pointage assisté « caméra directe » : à
+    partir d'une seule photo, retrouve QUEL agent c'est en la comparant aux
+    encodages faciaux déjà en cache (FicheAgent.face_encoding), sans passer
+    par une recherche par nom au préalable. Purement une aide à la saisie —
+    la vérification d'identité qui compte réellement reste celle, 1:1, de
+    ProxyPresenceView au moment de la confirmation du pointage (comparaison
+    ré-effectuée à partir de zéro, ceci ne fait que présélectionner un agent).
+    Réservé à ADMIN/SECRETAIRE, comme ProxyPresenceView."""
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    def post(self, request):
+        from .models import FicheAgent
+
+        caller_role = getattr(getattr(request.user, 'profile', None), 'role', None)
+        if caller_role not in ('ADMIN', 'SECRETAIRE'):
+            return Response({'error': 'Permissions insuffisantes'}, status=status.HTTP_403_FORBIDDEN)
+
+        photo = request.FILES.get('photo')
+        if not photo:
+            return Response({'error': 'Photo requise'}, status=status.HTTP_400_BAD_REQUEST)
+
+        from .face_match import identify_face
+
+        fiches = list(
+            FicheAgent.objects.filter(statut='actif')
+            .exclude(face_encoding__isnull=True)
+            .values_list('id', 'face_encoding')
+        )
+        known_ids = [fid for fid, _ in fiches]
+        known_encodings = [enc for _, enc in fiches]
+
+        result = identify_face(photo, known_encodings, known_ids)
+
+        if result['status'] == 'error':
+            return Response({'error': f"Identification impossible : {result['error']}"},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if result['status'] == 'ambiguous':
+            return Response(
+                {'matched': False, 'reason': 'ambiguous',
+                 'error': "Plusieurs agents se ressemblent de trop près — recherchez cet agent manuellement."},
+                status=status.HTTP_200_OK,
+            )
+        if result['status'] == 'no_match':
+            return Response(
+                {'matched': False, 'reason': 'no_match',
+                 'error': "Aucun agent reconnu. Recherchez-le manuellement, ou vérifiez sa photo de référence."},
+                status=status.HTTP_200_OK,
+            )
+
+        fiche_agent = FicheAgent.objects.select_related(
+            'direction', 'sous_direction', 'service',
+        ).get(id=result['fiche_agent_id'])
+        from .serializers_rh import FicheAgentSerializer
+        data = FicheAgentSerializer(fiche_agent, context={'request': request}).data
+        return Response({'matched': True, 'distance': result['distance'], 'fiche_agent': data},
+                        status=status.HTTP_200_OK)
+
+
 class ProxyPresenceView(APIView):
     """Pointage assisté (secrétariat/accueil) : enregistre présent/absent pour
     un agent qui n'a pas de smartphone ou l'a oublié. Réservé à ADMIN/SECRETAIRE
@@ -2342,8 +2430,10 @@ class ProxyPresenceView(APIView):
             if check['ok']:
                 verification_photo.seek(0)
                 fiche_agent.photo.save(
-                    f"auto_ref_{fiche_agent.id}.jpg", verification_photo, save=True,
+                    f"auto_ref_{fiche_agent.id}.jpg", verification_photo, save=False,
                 )
+                fiche_agent.face_encoding = check['encoding']
+                fiche_agent.save(update_fields=['photo', 'face_encoding', 'updated_at'])
                 logger.info(
                     '[ProxyPresenceView] Photo de référence établie automatiquement pour '
                     'fiche_agent=%s (%s) à partir du pointage assisté du %s',
