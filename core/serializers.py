@@ -502,7 +502,15 @@ class PresenceSerializer(serializers.ModelSerializer):
             model = Agent
             fields = ['id', 'nom', 'prenom', 'matricule', 'poste', 'service', 'service_obj', 'bureau', 'bureau_obj']
     
-    agent_details = AgentSerializer(source='agent', read_only=True)
+    # SerializerMethodField (et non plus AgentSerializer(source='agent') direct) :
+    # un pointage assisté (ProxyPresenceView) pour un agent sans ligne `Agent`
+    # (jamais inscrit sur l'app mobile — le cas normal pour "Pointage Agents")
+    # n'a que `fiche_agent` de renseigné, `agent` restant null. Sans ce repli,
+    # tous les écrans web qui affichent `agent_details` (UserInfo.js & co)
+    # retombaient sur "Utilisateur inconnu" alors que l'identité est connue
+    # côté `fiche_agent` — un seul point de correction ici profite à tous ces
+    # écrans sans les modifier un par un.
+    agent_details = serializers.SerializerMethodField()
     fiche_agent = serializers.PrimaryKeyRelatedField(read_only=True)
     enregistre_par = serializers.PrimaryKeyRelatedField(read_only=True)
     enregistre_par_info = serializers.SerializerMethodField()
@@ -521,6 +529,24 @@ class PresenceSerializer(serializers.ModelSerializer):
             'liveness_method', 'reference_photo_absente', 'face_match_distance',
         ]
         read_only_fields = ['id', 'agent', 'created_at', 'updated_at', 'localisation_valide']
+
+    def get_agent_details(self, obj):
+        if obj.agent_id:
+            return self.AgentSerializer(obj.agent, context=self.context).data
+        fiche = obj.fiche_agent
+        if fiche is None:
+            return None
+        return {
+            'id': fiche.id,
+            'nom': fiche.nom,
+            'prenom': fiche.prenoms,
+            'matricule': fiche.matricule,
+            'poste': fiche.fonction or fiche.emploi or '',
+            'service': fiche.service_id,
+            'service_obj': ServiceSerializer(fiche.service, context=self.context).data if fiche.service_id else None,
+            'bureau': None,
+            'bureau_obj': None,
+        }
 
     def get_enregistre_par_info(self, obj):
         if not obj.enregistre_par_id:
