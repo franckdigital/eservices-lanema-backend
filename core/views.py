@@ -1798,12 +1798,13 @@ class MesPresencesView(APIView):
                         duree = None
                 except (ValueError, IndexError):
                     pass
-            # Retard si arrivée après 9h00
+            # Retard si arrivée après 8h30 (aligné sur HEURE_LIMITE_PONCTUALITE
+            # de views_kpi_rh.py / HEURE_RETARD de views_executive_kpi.py)
             est_en_retard = False
             if arrivee:
                 try:
                     ah, am = int(arrivee[:2]), int(arrivee[3:5])
-                    est_en_retard = (ah * 60 + am) > (9 * 60)
+                    est_en_retard = (ah * 60 + am) > (8 * 60 + 30)
                 except (ValueError, IndexError):
                     pass
 
@@ -2550,7 +2551,11 @@ class OccurrenceSpecialeViewSet(viewsets.ModelViewSet):
 class PresencePagination(PageNumberPagination):
     page_size = 50
     page_size_query_param = 'per_page'
-    max_page_size = 200
+    # Les écrans de rapport (calendrier/statistiques mensuelles, export) ont
+    # besoin de TOUTES les présences d'une période en un seul appel — 200
+    # était insuffisant pour ~140 agents sur un mois (jusqu'à ~3000 lignes),
+    # ce qui les faisait planter ou afficher des totaux à zéro.
+    max_page_size = 5000
 
 class PresenceViewSet(viewsets.ModelViewSet):
     queryset = Presence.objects.all()
