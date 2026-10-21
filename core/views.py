@@ -1950,19 +1950,38 @@ class SimplePresenceView(APIView):
             today = reference_dt.date()
             current_time = reference_dt.time()
 
-            # Récupérer ou créer la présence du jour
-            presence, created = Presence.objects.get_or_create(
-                agent=agent,
-                date_presence=today,
-                defaults={
-                    'statut': 'présent',
-                    'latitude': corrected_latitude,
-                    'longitude': corrected_longitude,
-                    'localisation_valide': True,
-                    'captured_at': captured_at,
-                }
-            )
-            
+            # Récupérer la présence du jour — en cherchant aussi bien par
+            # `agent` (pointage self-service, cette vue) que par `fiche_agent`
+            # (pointage assisté via ProxyPresenceView, ex: admin/secrétaire
+            # faisant pointer l'agent sur son propre téléphone). Sans ce
+            # second critère, un agent déjà pointé par l'admin pouvait
+            # re-pointer lui-même juste après : get_or_create(agent=agent, ...)
+            # ne trouvait pas la présence créée par l'admin (qui n'a que
+            # `fiche_agent` de renseigné, `agent` restant null) et en créait
+            # une seconde.
+            fiche_agent = getattr(user, 'fiche_agent', None)
+            presence_filter = Q(agent=agent)
+            if fiche_agent is not None:
+                presence_filter |= Q(fiche_agent=fiche_agent)
+            presence = Presence.objects.filter(presence_filter, date_presence=today).order_by('id').first()
+            created = presence is None
+            if created:
+                presence = Presence.objects.create(
+                    agent=agent,
+                    date_presence=today,
+                    statut='présent',
+                    latitude=corrected_latitude,
+                    longitude=corrected_longitude,
+                    localisation_valide=True,
+                    captured_at=captured_at,
+                )
+            elif not presence.agent_id:
+                # Présence trouvée via fiche_agent (créée par un pointage
+                # assisté) : on la rattache aussi à `agent` pour que les
+                # prochaines recherches la retrouvent directement.
+                presence.agent = agent
+                presence.save(update_fields=['agent'])
+
             if action == 'arrivee':
                 if presence.heure_arrivee:
                     return Response({'error': 'Arrivée déjà enregistrée aujourd\'hui'}, status=status.HTTP_400_BAD_REQUEST)
@@ -2123,18 +2142,32 @@ class PresenceSyncView(APIView):
             else:
                 logger.warning(f'[PresenceSyncView] Aucune configuration GPS pour {user.username} — pointage sans validation géographique')
 
-            presence, presence_created = Presence.objects.get_or_create(
-                agent=agent,
-                date_presence=today,
-                defaults={
-                    'statut': 'présent',
-                    'latitude': latitude,
-                    'longitude': longitude,
-                    'localisation_valide': True,
-                    'local_id': local_id,
-                    'captured_at': captured_at,
-                }
-            )
+            # Même garde-fou que SimplePresenceView : chercher aussi via
+            # fiche_agent pour retrouver une présence créée par un pointage
+            # assisté (admin/secrétaire) et éviter d'en créer une seconde.
+            fiche_agent = getattr(user, 'fiche_agent', None)
+            presence_filter = Q(agent=agent)
+            if fiche_agent is not None:
+                presence_filter |= Q(fiche_agent=fiche_agent)
+            presence = Presence.objects.filter(presence_filter, date_presence=today).order_by('id').first()
+            presence_created = presence is None
+            if presence_created:
+                presence = Presence.objects.create(
+                    agent=agent,
+                    date_presence=today,
+                    statut='présent',
+                    latitude=latitude,
+                    longitude=longitude,
+                    localisation_valide=True,
+                    local_id=local_id,
+                    captured_at=captured_at,
+                )
+            else:
+                if not presence.agent_id:
+                    presence.agent = agent
+                if not presence.local_id:
+                    presence.local_id = local_id
+                presence.save(update_fields=['agent', 'local_id'])
 
             # Une présence couvre à la fois l'arrivée et le départ (une seule ligne
             # par agent/jour) : "déjà enregistré" ne peut donc pas se détecter par
@@ -2448,33 +2481,40 @@ class ProxyPresenceView(APIView):
         device_fingerprint = request.data.get('device_fingerprint')
         today = timezone.now().date()
 
-        lookup = {'fiche_agent': fiche_agent, 'date_presence': today}
+        # Une seule ligne par (agent, date) : on cherche par `agent` ET par
+        # `fiche_agent` (pas l'un ou l'autre) pour retrouver une présence déjà
+        # créée ce jour-là quel que soit le canal utilisé (auto-pointage via
+        # l'app, ou pointage assisté précédent dont `agent` n'avait pas pu
+        # être résolu) — sinon un agent déjà pointé par l'admin pouvait être
+        # re-pointé une seconde fois (par l'admin ou par lui-même).
+        presence_filter = Q(fiche_agent=fiche_agent)
         if agent_obj is not None:
-            # Une seule ligne par (agent, date) — cherche d'abord par agent si
-            # résolu, pour rester cohérent avec un éventuel auto-pointage déjà
-            # existant ce jour-là.
-            lookup = {'agent': agent_obj, 'date_presence': today}
-
-        presence, created = Presence.objects.get_or_create(
-            **lookup,
-            defaults={
-                'agent': agent_obj,
-                'fiche_agent': fiche_agent,
-                'statut': statut,
-                'latitude': latitude,
-                'longitude': longitude,
-                'localisation_valide': False,
-                'device_fingerprint': device_fingerprint,
-                'enregistre_par': request.user,
-                'verification_method': verification_method,
-                # Pas de sauvegarde de la photo capturée : voir commentaire
-                # sur Presence dans core/models.py.
-                'liveness_passed': liveness_passed,
-                'liveness_method': liveness_method,
-                'reference_photo_absente': had_no_reference_photo,
-                'face_match_distance': face_match_distance,
-            },
-        )
+            presence_filter |= Q(agent=agent_obj)
+        presence = Presence.objects.filter(presence_filter, date_presence=today).order_by('id').first()
+        created = presence is None
+        if created:
+            presence = Presence.objects.create(
+                agent=agent_obj,
+                fiche_agent=fiche_agent,
+                date_presence=today,
+                statut=statut,
+                latitude=latitude,
+                longitude=longitude,
+                localisation_valide=False,
+                device_fingerprint=device_fingerprint,
+                enregistre_par=request.user,
+                verification_method=verification_method,
+                liveness_passed=liveness_passed,
+                liveness_method=liveness_method,
+                reference_photo_absente=had_no_reference_photo,
+                face_match_distance=face_match_distance,
+            )
+        else:
+            if not presence.agent_id and agent_obj is not None:
+                presence.agent = agent_obj
+            if not presence.fiche_agent_id:
+                presence.fiche_agent = fiche_agent
+            presence.save(update_fields=['agent', 'fiche_agent'])
 
         # Arrivée et départ sont deux pointages distincts dans la même journée
         # (comme pour l'auto-pointage, cf. SimplePresenceView) : on ne les
