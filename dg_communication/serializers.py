@@ -29,9 +29,11 @@ class ProspectSerializer(serializers.ModelSerializer):
 
 
 class PartenariatSerializer(serializers.ModelSerializer):
+    responsable_nom = serializers.CharField(source="responsable.username", read_only=True, default=None)
+
     class Meta:
         model = Partenariat
-        fields = ["id", "nom_partenaire", "description", "date_signature", "statut", "responsable", "created_at"]
+        fields = ["id", "nom_partenaire", "description", "date_signature", "statut", "responsable", "responsable_nom", "created_at"]
         read_only_fields = ["id", "created_at"]
 
 

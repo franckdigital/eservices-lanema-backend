@@ -23,11 +23,14 @@ class NonConformiteQualiteSerializer(serializers.ModelSerializer):
 
 
 class ActionQualiteSerializer(serializers.ModelSerializer):
+    responsable_nom = serializers.CharField(source="responsable.username", read_only=True, default=None)
+    non_conformite_reference = serializers.CharField(source="non_conformite.reference", read_only=True, default=None)
+
     class Meta:
         model = ActionQualite
         fields = [
-            "id", "non_conformite", "type", "description", "responsable",
-            "statut", "date_planification", "date_cloture",
+            "id", "non_conformite", "non_conformite_reference", "type", "description", "responsable",
+            "responsable_nom", "statut", "date_planification", "date_cloture",
         ]
         read_only_fields = ["id", "date_planification"]
 
