@@ -2151,6 +2151,27 @@ class DocumentLog(models.Model):
         return f"{self.action} — {self.document.reference} par {self.utilisateur}"
 
 
+class RechercheDocumentaireLog(models.Model):
+    """Mesure du temps de recherche documentaire (KPI GED) : le frontend
+    chronomètre, pour une recherche donnée, l'intervalle entre la saisie du
+    terme et l'ouverture d'un résultat (ou l'abandon de la recherche), puis
+    poste la durée ici. Sert uniquement à calculer la moyenne consommée par
+    compute_ged_kpis() — pas d'usage d'audit/traçabilité individuelle."""
+    utilisateur = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True)
+    terme = models.CharField(max_length=255, blank=True)
+    duree_ms = models.PositiveIntegerField(help_text="Durée de la recherche en millisecondes")
+    resultat_trouve = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'Recherche documentaire (KPI)'
+        verbose_name_plural = 'Recherches documentaires (KPI)'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Recherche {self.duree_ms}ms par {self.utilisateur}"
+
+
 class CertificatArchivage(models.Model):
     """Certificat d'intégrité généré lors de l'archivage légal."""
     document = models.OneToOneField(

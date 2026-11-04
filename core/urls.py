@@ -38,7 +38,7 @@ from .ged_views import (
     ged_courriers_disponibles, ged_diligences_disponibles,
     ged_reunions_disponibles, ged_taches_disponibles,
 )
-from .views_kpi_ged import GedKPIDecisionnelView
+from .views_kpi_ged import GedKPIDecisionnelView, RechercheDocumentaireLogView
 from .views_kpi_rh import RHKPIDecisionnelView
 from django.urls import path, include
 from core.views_stats import PresenceStatsAPIView
@@ -144,6 +144,7 @@ urlpatterns = [
     path('ged/reunions-disponibles/', ged_reunions_disponibles, name='ged-reunions-disponibles'),
     path('ged/taches-disponibles/', ged_taches_disponibles, name='ged-taches-disponibles'),
     path('ged/kpi-decisionnel/', GedKPIDecisionnelView.as_view(), name='ged-kpi-decisionnel'),
+    path('ged/recherche-log/', RechercheDocumentaireLogView.as_view(), name='ged-recherche-log'),
     path('ged/partage/<uuid:token>/', SharedDocumentView.as_view(), name='ged-partage-public'),
     path('rh/kpi-decisionnel/', RHKPIDecisionnelView.as_view(), name='rh-kpi-decisionnel'),
     path('auth/register/', AgentRegistrationView.as_view(), name='register'),
