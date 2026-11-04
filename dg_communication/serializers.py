@@ -38,7 +38,15 @@ class PartenariatSerializer(serializers.ModelSerializer):
 
 
 class SatisfactionClientSerializer(serializers.ModelSerializer):
+    action_liee_titre = serializers.CharField(source="action_liee.titre", read_only=True, default=None)
+    recueilli_par_nom = serializers.CharField(source="recueilli_par.username", read_only=True, default=None)
+
     class Meta:
         model = SatisfactionClient
-        fields = ["id", "client_nom", "note", "fidele", "commentaire", "date_enquete"]
+        fields = [
+            "id", "client_nom", "organisation", "contact_email", "contact_telephone",
+            "action_liee", "action_liee_titre", "service_concerne", "canal_recueil",
+            "recueilli_par", "recueilli_par_nom", "note", "recommanderait", "fidele",
+            "commentaire", "date_enquete",
+        ]
         read_only_fields = ["id", "date_enquete"]

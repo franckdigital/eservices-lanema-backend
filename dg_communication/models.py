@@ -94,10 +94,45 @@ class Partenariat(models.Model):
 
 
 class SatisfactionClient(models.Model):
-    """Enquête de satisfaction ponctuelle liée aux actions marketing/commerciales."""
+    """Enquête de satisfaction ponctuelle liée aux actions marketing/commerciales.
+
+    Saisie manuellement par un agent après avoir recueilli l'avis du client
+    par un autre canal (téléphone, email, entretien...) — pas encore un
+    sondage self-service envoyé directement au client."""
+
+    CANAL_CHOICES = [
+        ("TELEPHONE", "Téléphone"),
+        ("EMAIL", "Email"),
+        ("ENTRETIEN", "Entretien en personne"),
+        ("FORMULAIRE", "Formulaire papier"),
+        ("AUTRE", "Autre"),
+    ]
 
     client_nom = models.CharField(max_length=255)
+    organisation = models.CharField(max_length=255, blank=True, help_text="Entreprise/structure du client")
+    contact_email = models.EmailField(blank=True)
+    contact_telephone = models.CharField(max_length=50, blank=True)
+    action_liee = models.ForeignKey(
+        ActionCommunication, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="enquetes_satisfaction",
+        help_text="Action/campagne à l'origine de la relation avec ce client, le cas échéant",
+    )
+    service_concerne = models.CharField(
+        max_length=255, blank=True, help_text="Prestation ou service concerné par cette enquête"
+    )
+    canal_recueil = models.CharField(
+        max_length=20, choices=CANAL_CHOICES, blank=True,
+        help_text="Comment l'avis du client a été recueilli",
+    )
+    recueilli_par = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="enquetes_satisfaction_recueillies",
+        help_text="Agent ayant recueilli et saisi cet avis",
+    )
     note = models.PositiveSmallIntegerField(help_text="Note sur 5")
+    recommanderait = models.BooleanField(
+        null=True, blank=True, help_text="Le client recommanderait-il le LANEMA ? (laisser vide si non demandé)"
+    )
     fidele = models.BooleanField(default=False, help_text="Client fidélisé (renouvellement)")
     commentaire = models.TextField(blank=True)
     date_enquete = models.DateField(auto_now_add=True)

@@ -51,6 +51,21 @@ class ReclamationClientSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ["id", "date_reception"]
 
+    def validate(self, attrs):
+        # Les KPI "délai moyen de traitement" et "taux de satisfaction client"
+        # dépendent de ces deux champs : les rendre obligatoires dès que le
+        # statut passe à TRAITEE évite des réclamations "traitées" sans date
+        # ni note, qui fausseraient ces indicateurs silencieusement.
+        statut = attrs.get("statut", getattr(self.instance, "statut", None))
+        if statut == "TRAITEE":
+            date_traitement = attrs.get("date_traitement", getattr(self.instance, "date_traitement", None))
+            note_satisfaction = attrs.get("note_satisfaction", getattr(self.instance, "note_satisfaction", None))
+            if not date_traitement:
+                raise serializers.ValidationError({"date_traitement": "Requis lorsque le statut est « Traitée »."})
+            if not note_satisfaction:
+                raise serializers.ValidationError({"note_satisfaction": "Requise lorsque le statut est « Traitée »."})
+        return attrs
+
 
 class RevueDirectionSerializer(serializers.ModelSerializer):
     class Meta:

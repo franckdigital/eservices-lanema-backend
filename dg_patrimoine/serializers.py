@@ -22,7 +22,10 @@ class MouvementBienSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = MouvementBien
-        fields = ["id", "bien", "bien_code", "type_mouvement", "motif", "date_mouvement", "effectue_par", "effectue_par_nom"]
+        fields = [
+            "id", "bien", "bien_code", "type_mouvement", "quantite", "emplacement", "motif",
+            "date_mouvement", "effectue_par", "effectue_par_nom",
+        ]
         read_only_fields = ["id", "date_mouvement"]
 
 
@@ -31,7 +34,10 @@ class MaintenanceBienSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = MaintenanceBien
-        fields = ["id", "bien", "bien_code", "type_maintenance", "date_maintenance", "date_fin", "cout", "description"]
+        fields = [
+            "id", "bien", "bien_code", "type_maintenance", "quantite", "emplacement",
+            "date_maintenance", "date_fin", "cout", "description",
+        ]
         read_only_fields = ["id"]
 
 
@@ -41,7 +47,7 @@ class InventairePatrimoineSerializer(serializers.ModelSerializer):
     class Meta:
         model = InventairePatrimoine
         fields = [
-            "id", "date_inventaire", "responsable", "responsable_nom", "nombre_biens_verifies",
-            "ecarts_constates", "observations", "created_at",
+            "id", "date_inventaire", "responsable", "responsable_nom", "emplacement",
+            "nombre_biens_verifies", "ecarts_constates", "observations", "created_at",
         ]
         read_only_fields = ["id", "created_at"]

@@ -49,6 +49,10 @@ class MouvementBien(models.Model):
 
     bien = models.ForeignKey(Bien, on_delete=models.CASCADE, related_name="mouvements")
     type_mouvement = models.CharField(max_length=20, choices=TYPE_CHOICES)
+    quantite = models.PositiveIntegerField(default=1, help_text="Nombre d'unités concernées par ce mouvement")
+    emplacement = models.CharField(
+        max_length=255, blank=True, help_text="Nouvel emplacement du bien après ce mouvement (destination)"
+    )
     motif = models.TextField(blank=True)
     date_mouvement = models.DateTimeField(auto_now_add=True)
     effectue_par = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="mouvements_bien")
@@ -68,6 +72,8 @@ class MaintenanceBien(models.Model):
 
     bien = models.ForeignKey(Bien, on_delete=models.CASCADE, related_name="maintenances")
     type_maintenance = models.CharField(max_length=20, choices=TYPE_CHOICES, default="PREVENTIVE")
+    quantite = models.PositiveIntegerField(default=1, help_text="Nombre d'unités concernées par cette maintenance")
+    emplacement = models.CharField(max_length=255, blank=True, help_text="Lieu où la maintenance est effectuée")
     date_maintenance = models.DateField()
     date_fin = models.DateField(null=True, blank=True)
     cout = models.DecimalField(max_digits=12, decimal_places=2, default=0)
@@ -83,6 +89,7 @@ class MaintenanceBien(models.Model):
 class InventairePatrimoine(models.Model):
     date_inventaire = models.DateField()
     responsable = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="inventaires_patrimoine")
+    emplacement = models.CharField(max_length=255, blank=True, help_text="Zone / emplacement inventorié")
     nombre_biens_verifies = models.PositiveIntegerField(default=0)
     ecarts_constates = models.PositiveIntegerField(default=0)
     observations = models.TextField(blank=True)

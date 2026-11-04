@@ -128,11 +128,21 @@ class Command(BaseCommand):
                 description="Partenariat institutionnel — données de démonstration.",
             )
 
+        services_demo = ["Essais de laboratoire", "Métrologie", "Certification", "Formation", "Audit qualité"]
         for i in range(12):
             SatisfactionClient.objects.create(
                 client_nom=f"Client démo {i + 1}",
+                organisation=random.choice(["SARL Koffi & Fils", "Ministère XYZ", "Groupe Industriel CI", ""]),
+                contact_email=f"client.demo{i + 1}@example.com",
+                contact_telephone=f"07{random.randint(10000000, 99999999)}",
+                action_liee=random.choice(actions) if actions and random.random() > 0.3 else None,
+                service_concerne=random.choice(services_demo),
+                canal_recueil=random.choice(["TELEPHONE", "EMAIL", "ENTRETIEN", "FORMULAIRE"]),
+                recueilli_par=responsable,
                 note=random.choice([3, 4, 4, 5, 5, 5, 2]),
+                recommanderait=random.choice([True, True, False, None]),
                 fidele=random.random() > 0.4,
+                commentaire="Retour client — données de démonstration.",
             )
 
     # ------------------------------------------------------------------
@@ -233,10 +243,12 @@ class Command(BaseCommand):
             )
             biens.append(b)
 
+        emplacements = ["Siège LANEMA, Abidjan", "Annexe Cocody", "Entrepôt Yopougon", "Direction Générale"]
         mouv_types = {"EN_SERVICE": "ENTREE", "EN_MAINTENANCE": "TRANSFERT", "REFORME": "REFORME", "PERDU": "PERTE", "SORTI": "SORTIE"}
         for b in biens:
             MouvementBien.objects.create(
                 bien=b, type_mouvement=mouv_types.get(b.statut, "ENTREE"),
+                quantite=1, emplacement=random.choice(emplacements),
                 motif=f"Mouvement initial — {b.get_statut_display()}", effectue_par=responsable,
             )
         # quelques mouvements supplémentaires pour varier les stats
@@ -244,12 +256,14 @@ class Command(BaseCommand):
             b = random.choice(biens)
             MouvementBien.objects.create(
                 bien=b, type_mouvement=random.choice(["TRANSFERT", "ENTREE"]),
+                quantite=random.choice([1, 1, 2, 5]), emplacement=random.choice(emplacements),
                 motif="Mouvement complémentaire — démonstration.", effectue_par=responsable,
             )
 
         for b in [biens[5], biens[0], biens[2]]:  # groupe électrogène, véhicule, serveur
             MaintenanceBien.objects.create(
                 bien=b, type_maintenance=random.choice(["PREVENTIVE", "CORRECTIVE"]),
+                quantite=1, emplacement=random.choice(emplacements),
                 date_maintenance=jours_avant(random.randint(5, 120)),
                 date_fin=jours_avant(random.randint(1, 4)),
                 cout=Decimal(random.choice([50_000, 120_000, 300_000, 450_000])),
@@ -259,6 +273,7 @@ class Command(BaseCommand):
         for i, j in enumerate([30, 120, 300]):
             InventairePatrimoine.objects.create(
                 date_inventaire=jours_avant(j), responsable=responsable,
+                emplacement=emplacements[i % len(emplacements)],
                 nombre_biens_verifies=len(biens) - i, ecarts_constates=i,
                 observations="Inventaire — données de démonstration.",
             )
