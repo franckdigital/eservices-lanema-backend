@@ -492,15 +492,16 @@ class PresenceSerializer(serializers.ModelSerializer):
     class AgentSerializer(serializers.ModelSerializer):
         service_obj = ServiceSerializer(source='service', read_only=True)
         bureau_obj = serializers.SerializerMethodField()
-        
+        user_id = serializers.PrimaryKeyRelatedField(source='user', read_only=True)
+
         def get_bureau_obj(self, obj):
             if obj.bureau:
                 return {'id': obj.bureau.id, 'nom': obj.bureau.nom}
             return None
-        
+
         class Meta:
             model = Agent
-            fields = ['id', 'nom', 'prenom', 'matricule', 'poste', 'service', 'service_obj', 'bureau', 'bureau_obj']
+            fields = ['id', 'user_id', 'nom', 'prenom', 'matricule', 'poste', 'service', 'service_obj', 'bureau', 'bureau_obj']
     
     # SerializerMethodField (et non plus AgentSerializer(source='agent') direct) :
     # un pointage assisté (ProxyPresenceView) pour un agent sans ligne `Agent`
@@ -538,6 +539,7 @@ class PresenceSerializer(serializers.ModelSerializer):
             return None
         return {
             'id': fiche.id,
+            'user_id': fiche.user_id,
             'nom': fiche.nom,
             'prenom': fiche.prenoms,
             'matricule': fiche.matricule,
