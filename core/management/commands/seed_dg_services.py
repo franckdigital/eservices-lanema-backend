@@ -303,8 +303,9 @@ class Command(BaseCommand):
             ("EXTERNE", "Cabinet Audit CI", "CONFORME"), ("ISO", "Bureau Veritas", "CONFORME"),
             ("ISO", "Bureau Veritas", "NON_CONFORME"),
         ]
-        for type_, organisme, resultat in audits_data:
+        for i, (type_, organisme, resultat) in enumerate(audits_data):
             AuditQualite.objects.create(
+                reference=f"AUD-DEMO-{i + 1:03d}",
                 type_audit=type_, organisme=organisme, date_audit=jours_avant(random.randint(10, 300)),
                 resultat=resultat, observations="Audit — données de démonstration.",
             )
