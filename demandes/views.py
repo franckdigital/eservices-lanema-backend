@@ -1,21 +1,25 @@
+import json
 import secrets
 import string
+from datetime import timedelta
 from decimal import Decimal
 
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.mail import send_mail
 from django.db.models import Count
+from django.utils import timezone
 
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import DemandeDevis, EchantillonPrevu
-from .serializers import DemandeDevisSerializer
+from .models import CreneauDisponibilite, DemandeDevis, EchantillonPrevu, SousTraitantPartenaire
+from .serializers import CreneauDisponibiliteSerializer, DemandeDevisSerializer, SousTraitantPartenaireSerializer
 from clients.models import ClientProfile
-from facturation.models import Proforma
+from clients.permissions_catalog import user_has_permission
+from facturation.models import BonCommande, Facture, Proforma
 
 
 TVA_RATE = Decimal("0.1925")  # 19,25 %
@@ -124,7 +128,25 @@ def calculer_montant_demande(type_analyse: str, categorie: str, priorite: str, e
     return montant_ht, montant_ttc
 
 
-def creer_devis_et_proforma(client, type_analyse, categorie, objet, description, priorite, echantillons):
+def delai_actuel():
+    """Creneau de disponibilite applicable aujourd'hui (ou, a defaut, le
+    prochain a venir), annonce sur le formulaire public de devis — parametre
+    depuis l'espace du service reception (CreneauDisponibiliteViewSet)."""
+    today = timezone.now().date()
+    creneau = CreneauDisponibilite.objects.filter(
+        actif=True, date_debut__lte=today, date_fin__gte=today
+    ).order_by("date_debut").first()
+    if creneau is None:
+        creneau = CreneauDisponibilite.objects.filter(
+            actif=True, date_debut__gte=today
+        ).order_by("date_debut").first()
+    return creneau
+
+
+def creer_devis_et_proforma(
+    client, type_analyse, categorie, objet, description, priorite, echantillons,
+    accord_sous_traitance=False, sous_traitants_ids=None, sous_traitants_libres="",
+):
     """Cree une DemandeDevis + sa Proforma associee (montant calcule et fige).
     Factorise entre DemandeDevisViewSet.perform_create (client authentifie) et
     PublicDevisCreateView (formulaire public, compte cree a la volee)."""
@@ -134,10 +156,18 @@ def creer_devis_et_proforma(client, type_analyse, categorie, objet, description,
         last_id += 1
         numero = f"DEV-{last_id:05d}"
 
+    creneau = delai_actuel()
     demande = DemandeDevis.objects.create(
         client=client, numero=numero, type_analyse=type_analyse,
         categorie=categorie, objet=objet, description=description,
+        delai_realisation_jours=creneau.delai_jours_ouvres if creneau else None,
+        accord_sous_traitance=bool(accord_sous_traitance),
+        sous_traitants_souhaits_libres=sous_traitants_libres or "",
     )
+    if sous_traitants_ids:
+        demande.sous_traitants_choisis.set(
+            SousTraitantPartenaire.objects.filter(id__in=sous_traitants_ids)
+        )
     EchantillonPrevu.objects.bulk_create([
         EchantillonPrevu(demande=demande, nom=(e.get("nom") or "").strip() or "Échantillon", quantite=e.get("quantite") or 1)
         for e in (echantillons or [])
@@ -195,6 +225,11 @@ class PublicDevisCreateView(APIView):
         description = str(data.get("description", "")).strip()
         priorite = str(data.get("priorite", "NORMALE")).strip()
         echantillons = data.get("echantillons") or []
+        if isinstance(echantillons, str):
+            try:
+                echantillons = json.loads(echantillons)
+            except (TypeError, ValueError):
+                echantillons = []
         if not type_analyse or not objet:
             return Response({"detail": "Type d'analyse et objet requis."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -204,6 +239,18 @@ class PublicDevisCreateView(APIView):
         telephone = str(data.get("telephone", "")).strip()
         domaine_activite = str(data.get("domaine_activite", "")).strip()
         situation_geographique = str(data.get("situation_geographique", "")).strip()
+
+        accord_sous_traitance = str(data.get("accord_sous_traitance", "")).lower() in ("true", "1", "on")
+        sous_traitants_libres = str(data.get("sous_traitants_libres", "")).strip()
+        sous_traitants_raw = data.get("sous_traitants_choisis")
+        if isinstance(sous_traitants_raw, str):
+            try:
+                sous_traitants_raw = json.loads(sous_traitants_raw)
+            except (TypeError, ValueError):
+                sous_traitants_raw = []
+        sous_traitants_ids = [i for i in (sous_traitants_raw or []) if i not in (None, "")]
+
+        signature = request.FILES.get("signature_client_image")
 
         user = User.objects.filter(email__iexact=email).first()
         compte_cree = False
@@ -244,14 +291,50 @@ class PublicDevisCreateView(APIView):
         demande, proforma = creer_devis_et_proforma(
             client=user, type_analyse=type_analyse, categorie=categorie, objet=objet,
             description=description, priorite=priorite, echantillons=echantillons,
+            accord_sous_traitance=accord_sous_traitance, sous_traitants_ids=sous_traitants_ids,
+            sous_traitants_libres=sous_traitants_libres,
         )
 
+        bon_pour_accord = False
+        if signature is not None:
+            bon_pour_accord = True
+            proforma.statut = "ACCEPTEE"
+            proforma.save(update_fields=["statut"])
+            demande.statut = "ACCEPTEE"
+            demande.save(update_fields=["statut"])
+
+            suffixe = proforma.numero.split("-")[-1]
+            bc_numero = f"BC-{suffixe}"
+            if BonCommande.objects.filter(numero=bc_numero).exists():
+                bc_numero = f"BC-{BonCommande.objects.count() + 1:05d}"
+            bon_commande = BonCommande.objects.create(
+                numero=bc_numero, client=user, proforma=proforma,
+                montant_ht=proforma.montant_ht, montant_ttc=proforma.montant_ttc, devise=proforma.devise,
+                statut="SIGNE_CLIENT", signature_client_image=signature, date_signature_client=timezone.now().date(),
+            )
+            fac_numero = f"FAC-{suffixe}"
+            if Facture.objects.filter(numero=fac_numero).exists():
+                fac_numero = f"FAC-{Facture.objects.count() + 1:05d}"
+            date_emission = timezone.now().date()
+            facture = Facture.objects.create(
+                numero=fac_numero, client=user, proforma=proforma, bon_commande=bon_commande,
+                montant_ht=proforma.montant_ht, montant_ttc=proforma.montant_ttc, devise=proforma.devise,
+                statut="EN_ATTENTE", date_emission=date_emission, date_echeance=date_emission + timedelta(days=30),
+                visible_client=True,
+            )
+            # Import local pour eviter une dependance circulaire au chargement du module.
+            from facturation.views import _creer_demande_analyse_si_absente
+            _creer_demande_analyse_si_absente(facture)
+
         espace_url = f"{getattr(settings, 'FRONTEND_BASE_URL', 'https://e-services.lanema-ci.com')}/devis/connexion"
+        delai_txt = f"{demande.delai_realisation_jours} jours ouvres" if demande.delai_realisation_jours else "24h ouvrees"
         if compte_cree:
             subject = "Votre compte client LANEMA et votre demande de devis"
             message = (
                 f"Bonjour {first_name or ''},\n\n"
-                f"Votre demande de devis {demande.numero} a bien ete enregistree aupres du laboratoire LANEMA.\n\n"
+                f"Votre demande de devis {demande.numero} a bien ete enregistree aupres du laboratoire LANEMA"
+                f"{' et signee (bon pour accord)' if bon_pour_accord else ''}.\n"
+                f"Elle sera traitee sous {delai_txt}.\n\n"
                 "Un espace client a ete cree automatiquement pour vous permettre de suivre votre dossier :\n"
                 f"  - Identifiant (email) : {email}\n"
                 f"  - Mot de passe : {mot_de_passe}\n\n"
@@ -263,7 +346,9 @@ class PublicDevisCreateView(APIView):
             subject = "Nouvelle demande de devis enregistree"
             message = (
                 f"Bonjour {first_name or ''},\n\n"
-                f"Votre demande de devis {demande.numero} a bien ete enregistree aupres du laboratoire LANEMA.\n\n"
+                f"Votre demande de devis {demande.numero} a bien ete enregistree aupres du laboratoire LANEMA"
+                f"{' et signee (bon pour accord)' if bon_pour_accord else ''}.\n"
+                f"Elle sera traitee sous {delai_txt}.\n\n"
                 f"Suivez son avancement depuis votre espace client : {espace_url}\n\n"
                 "L'equipe LANEMA"
             )
@@ -286,7 +371,91 @@ class PublicDevisCreateView(APIView):
             "mot_de_passe": mot_de_passe,
             "code_client": getattr(getattr(user, "client_profile", None), "code_client", None),
             "espace_url": espace_url,
+            "delai_realisation_jours": demande.delai_realisation_jours,
+            "bon_pour_accord": bon_pour_accord,
         }, status=status.HTTP_201_CREATED)
+
+
+class DelaiActuelView(APIView):
+    """Delai de realisation actuellement annonce (cf. CreneauDisponibilite) —
+    consulte publiquement par le formulaire de demande de devis."""
+
+    permission_classes = [permissions.AllowAny]
+    authentication_classes = []
+
+    def get(self, request):
+        creneau = delai_actuel()
+        if creneau is None:
+            return Response({"delai_jours_ouvres": None, "label": None})
+        return Response(CreneauDisponibiliteSerializer(creneau).data)
+
+
+class CreneauDisponibiliteViewSet(viewsets.ModelViewSet):
+    """Parametrage des plages de disponibilite (service reception) — cf.
+    cahier des charges EN 002-PG002, champ "Delais de realisation" du devis."""
+
+    queryset = CreneauDisponibilite.objects.all()
+    serializer_class = CreneauDisponibiliteSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _check_labo_staff(self):
+        if not user_has_permission(self.request.user, "echantillons.manage"):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("Seul le personnel du laboratoire peut gerer les delais.")
+
+    def perform_create(self, serializer):
+        self._check_labo_staff()
+        serializer.save()
+
+    def perform_update(self, serializer):
+        self._check_labo_staff()
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        self._check_labo_staff()
+        instance.delete()
+
+
+class SousTraitantPartenaireViewSet(viewsets.ModelViewSet):
+    """Catalogue des sous-traitants (partenaires officiels LANEMA + sous-traitants
+    souhaites par des clients, formalises par le service reception) — la liste
+    des partenaires actifs est consultable publiquement depuis le formulaire
+    de devis (choix du client), la gestion est reservee au personnel labo."""
+
+    queryset = SousTraitantPartenaire.objects.all()
+    serializer_class = SousTraitantPartenaireSerializer
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [permissions.AllowAny()]
+        return [permissions.IsAuthenticated()]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if self.action == "list" and not (self.request.user and self.request.user.is_authenticated):
+            # Formulaire public : uniquement les partenaires officiels actifs.
+            queryset = queryset.filter(actif=True, type_sous_traitant="PARTENAIRE")
+        type_filter = self.request.query_params.get("type")
+        if type_filter:
+            queryset = queryset.filter(type_sous_traitant=type_filter)
+        return queryset
+
+    def _check_labo_staff(self):
+        if not user_has_permission(self.request.user, "echantillons.manage"):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("Seul le personnel du laboratoire peut gerer les sous-traitants.")
+
+    def perform_create(self, serializer):
+        self._check_labo_staff()
+        serializer.save()
+
+    def perform_update(self, serializer):
+        self._check_labo_staff()
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        self._check_labo_staff()
+        instance.delete()
 
 
 class DemandeDevisViewSet(viewsets.ModelViewSet):

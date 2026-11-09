@@ -190,6 +190,114 @@ def _draw_client_signature(canvas_obj, x, y, bon_commande):
     canvas_obj.setFillColor(colors.black)
 
 
+def _generer_proforma_pdf(proforma):
+    """Construit le PDF d'un devis (Proforma) et renvoie les octets bruts.
+    Reutilise par ProformaViewSet.telecharger_pdf (JSON base64) et
+    ProformaViewSet.envoyer_devis (piece jointe email)."""
+
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.pdfgen import canvas
+    from reportlab.platypus import Table, TableStyle
+
+    buffer = BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+
+    primary = colors.HexColor("#0B57A4")
+
+    # Header
+    c.setFillColor(primary)
+    c.rect(0, height - 45 * mm, width, 45 * mm, fill=1, stroke=0)
+    c.setFillColor(colors.white)
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(18 * mm, height - 22 * mm, "LANEMA")
+    c.setFont("Helvetica-Bold", 14)
+    c.drawRightString(width - 18 * mm, height - 20 * mm, "DEVIS")
+    c.setFont("Helvetica", 10)
+    c.drawRightString(width - 18 * mm, height - 28 * mm, f"N° {proforma.numero}")
+    c.drawRightString(
+        width - 18 * mm,
+        height - 34 * mm,
+        f"Date: {proforma.date_emission.strftime('%d/%m/%Y') if proforma.date_emission else ''}",
+    )
+
+    # Client box
+    y = height - 58 * mm
+    c.setFillColor(colors.HexColor("#F3F6FB"))
+    c.roundRect(18 * mm, y - 25 * mm, width - 36 * mm, 22 * mm, 6, fill=1, stroke=0)
+    c.setFillColor(colors.black)
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(22 * mm, y - 9 * mm, "Client")
+    c.setFont("Helvetica", 10)
+    client_profile = getattr(proforma.client, "client_profile", None)
+    client_name = getattr(client_profile, "raison_sociale", "") or proforma.client.email
+    code_client = getattr(client_profile, "code_client", "") or ""
+    c.drawString(22 * mm, y - 15 * mm, f"{client_name}" + (f"  (Code : {code_client})" if code_client else ""))
+    c.drawString(22 * mm, y - 20 * mm, proforma.client.email)
+
+    # Table (simple, 1 ligne)
+    data = [["Description", "Tarif", "Qté", "Montant"]]
+    description = f"Prestations laboratoire - {proforma.demande_devis.numero if proforma.demande_devis else 'Demande'}"
+    data.append([description, "-", "1", f"{proforma.montant_ttc} {proforma.devise}"])
+
+    table = Table(data, colWidths=[90 * mm, 30 * mm, 20 * mm, 35 * mm])
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), primary),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, 0), 9),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#C9D7EE")),
+                ("FONTSIZE", (0, 1), (-1, -1), 9),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("BACKGROUND", (0, 1), (-1, -1), colors.white),
+            ]
+        )
+    )
+    table.wrapOn(c, width - 36 * mm, 100 * mm)
+    table.drawOn(c, 18 * mm, y - 60 * mm)
+
+    # Delai de realisation / sous-traitance, si la demande liee en porte
+    demande = proforma.demande_devis
+    info_y = y - 72 * mm
+    if demande is not None:
+        c.setFont("Helvetica", 9)
+        c.setFillColor(colors.HexColor("#334155"))
+        if demande.delai_realisation_jours:
+            c.drawString(18 * mm, info_y, f"Délai de réalisation : {demande.delai_realisation_jours} jours ouvrés")
+            info_y -= 5 * mm
+        c.drawString(18 * mm, info_y, f"Accord de sous-traitance : {'Oui' if demande.accord_sous_traitance else 'Non'}")
+        c.setFillColor(colors.black)
+
+    # Totals
+    total_y = y - 110 * mm
+    c.setFont("Helvetica", 10)
+    c.drawRightString(width - 18 * mm, total_y, f"Sous total: {proforma.montant_ht} {proforma.devise}")
+    tva = (float(proforma.montant_ttc) - float(proforma.montant_ht)) if proforma.montant_ttc is not None and proforma.montant_ht is not None else 0
+    c.drawRightString(width - 18 * mm, total_y - 6 * mm, f"TVA: {tva:.2f} {proforma.devise}")
+    c.setFont("Helvetica-Bold", 11)
+    c.drawRightString(width - 18 * mm, total_y - 13 * mm, f"Total: {proforma.montant_ttc} {proforma.devise}")
+
+    # Signature responsable labo
+    _draw_responsable_signature(c, 18 * mm, total_y - 30 * mm, proforma)
+
+    # Footer
+    c.setFont("Helvetica-Oblique", 10)
+    c.setFillColor(colors.HexColor("#2D7EDB"))
+    c.drawCentredString(width / 2, 20 * mm, "Merci pour votre confiance !")
+    c.setFillColor(colors.black)
+
+    c.showPage()
+    c.save()
+
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+    return pdf_bytes
+
+
 class ProformaViewSet(viewsets.ModelViewSet):
     queryset = Proforma.objects.select_related("client").all()
     serializer_class = ProformaSerializer
@@ -252,99 +360,61 @@ class ProformaViewSet(viewsets.ModelViewSet):
 
         import base64
 
-        from reportlab.lib import colors
-        from reportlab.lib.pagesizes import A4
-        from reportlab.lib.units import mm
-        from reportlab.pdfgen import canvas
-        from reportlab.platypus import Table, TableStyle
-
         proforma = self.get_object()
-
-        buffer = BytesIO()
-        c = canvas.Canvas(buffer, pagesize=A4)
-        width, height = A4
-
-        primary = colors.HexColor("#0B57A4")
-
-        # Header
-        c.setFillColor(primary)
-        c.rect(0, height - 45 * mm, width, 45 * mm, fill=1, stroke=0)
-        c.setFillColor(colors.white)
-        c.setFont("Helvetica-Bold", 18)
-        c.drawString(18 * mm, height - 22 * mm, "LANEMA")
-        c.setFont("Helvetica-Bold", 14)
-        c.drawRightString(width - 18 * mm, height - 20 * mm, "DEVIS")
-        c.setFont("Helvetica", 10)
-        c.drawRightString(width - 18 * mm, height - 28 * mm, f"N° {proforma.numero}")
-        c.drawRightString(
-            width - 18 * mm,
-            height - 34 * mm,
-            f"Date: {proforma.date_emission.strftime('%d/%m/%Y') if proforma.date_emission else ''}",
-        )
-
-        # Client box
-        y = height - 58 * mm
-        c.setFillColor(colors.HexColor("#F3F6FB"))
-        c.roundRect(18 * mm, y - 25 * mm, width - 36 * mm, 22 * mm, 6, fill=1, stroke=0)
-        c.setFillColor(colors.black)
-        c.setFont("Helvetica-Bold", 10)
-        c.drawString(22 * mm, y - 9 * mm, "Client")
-        c.setFont("Helvetica", 10)
-        client_name = getattr(getattr(proforma.client, "client_profile", None), "raison_sociale", "") or proforma.client.email
-        c.drawString(22 * mm, y - 15 * mm, client_name)
-        c.drawString(22 * mm, y - 20 * mm, proforma.client.email)
-
-        # Table (simple, 1 ligne)
-        data = [["Description", "Tarif", "Qté", "Montant"]]
-        description = f"Prestations laboratoire - {proforma.demande_devis.numero if proforma.demande_devis else 'Demande'}"
-        data.append([description, "-", "1", f"{proforma.montant_ttc} {proforma.devise}"])
-
-        table = Table(data, colWidths=[90 * mm, 30 * mm, 20 * mm, 35 * mm])
-        table.setStyle(
-            TableStyle(
-                [
-                    ("BACKGROUND", (0, 0), (-1, 0), primary),
-                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                    ("FONTSIZE", (0, 0), (-1, 0), 9),
-                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#C9D7EE")),
-                    ("FONTSIZE", (0, 1), (-1, -1), 9),
-                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                    ("BACKGROUND", (0, 1), (-1, -1), colors.white),
-                ]
-            )
-        )
-        tw, th = table.wrapOn(c, width - 36 * mm, 100 * mm)
-        table.drawOn(c, 18 * mm, y - 60 * mm)
-
-        # Totals
-        total_y = y - 110 * mm
-        c.setFont("Helvetica", 10)
-        c.drawRightString(width - 18 * mm, total_y, f"Sous total: {proforma.montant_ht} {proforma.devise}")
-        tva = (float(proforma.montant_ttc) - float(proforma.montant_ht)) if proforma.montant_ttc is not None and proforma.montant_ht is not None else 0
-        c.drawRightString(width - 18 * mm, total_y - 6 * mm, f"TVA: {tva:.2f} {proforma.devise}")
-        c.setFont("Helvetica-Bold", 11)
-        c.drawRightString(width - 18 * mm, total_y - 13 * mm, f"Total: {proforma.montant_ttc} {proforma.devise}")
-
-        # Signature responsable labo
-        _draw_responsable_signature(c, 18 * mm, total_y - 30 * mm, proforma)
-
-        # Footer
-        c.setFont("Helvetica-Oblique", 10)
-        c.setFillColor(colors.HexColor("#2D7EDB"))
-        c.drawCentredString(width / 2, 20 * mm, "Merci pour votre confiance !")
-        c.setFillColor(colors.black)
-
-        c.showPage()
-        c.save()
-
-        pdf_bytes = buffer.getvalue()
-        buffer.close()
-
+        pdf_bytes = _generer_proforma_pdf(proforma)
         content_b64 = base64.b64encode(pdf_bytes).decode("ascii")
         filename = f"Devis_{proforma.numero}.pdf"
 
         return Response({"filename": filename, "content": content_b64})
+
+    @action(detail=True, methods=["post"], url_path="envoyer_devis")
+    def envoyer_devis(self, request, pk=None):
+        """Envoie le devis (PDF) par email au client — depuis l'espace du
+        service reception, apres ajustement eventuel des montants
+        (cf. ajuster_montants). Le PDF reste egalement telechargeable pour un
+        envoi manuel via WhatsApp (pas d'API WhatsApp Business disponible :
+        la piece jointe ne peut pas etre poussee automatiquement, cf. lien
+        wa.me renvoye au frontend)."""
+
+        from django.conf import settings
+        from django.core.mail import EmailMessage
+
+        proforma = self.get_object()
+        pdf_bytes = _generer_proforma_pdf(proforma)
+
+        client_profile = getattr(proforma.client, "client_profile", None)
+        telephone = getattr(client_profile, "telephone", "") or ""
+        raison_sociale = getattr(client_profile, "raison_sociale", "") or proforma.client.first_name
+
+        subject = f"Votre devis {proforma.numero} — LANEMA"
+        body = (
+            f"Bonjour {raison_sociale or ''},\n\n"
+            f"Veuillez trouver ci-joint votre devis {proforma.numero} d'un montant de "
+            f"{proforma.montant_ttc} {proforma.devise} TTC.\n\n"
+            "Vous pouvez egalement le consulter a tout moment depuis votre espace client.\n\n"
+            "L'equipe LANEMA"
+        )
+        try:
+            email = EmailMessage(
+                subject=subject, body=body,
+                from_email=getattr(settings, "DEFAULT_FROM_EMAIL", None),
+                to=[proforma.client.email],
+            )
+            email.attach(f"Devis_{proforma.numero}.pdf", pdf_bytes, "application/pdf")
+            email.send(fail_silently=True)
+            email_envoye = True
+        except Exception:
+            email_envoye = False
+
+        proforma.statut = "ENVOYEE"
+        proforma.save(update_fields=["statut"])
+
+        return Response({
+            "detail": "Devis envoye",
+            "email_envoye": email_envoye,
+            "telephone_client": telephone,
+            "numero": proforma.numero,
+        })
 
     @action(detail=True, methods=["post"], url_path="ajuster_montants")
     def ajuster_montants(self, request, pk=None):
