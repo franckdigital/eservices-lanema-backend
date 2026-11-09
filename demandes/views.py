@@ -1,5 +1,10 @@
+import secrets
+import string
 from decimal import Decimal
 
+from django.conf import settings
+from django.contrib.auth.models import User
+from django.core.mail import send_mail
 from django.db.models import Count
 
 from rest_framework import permissions, status, viewsets
@@ -7,8 +12,9 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import DemandeDevis
+from .models import DemandeDevis, EchantillonPrevu
 from .serializers import DemandeDevisSerializer
+from clients.models import ClientProfile
 from facturation.models import Proforma
 
 
@@ -118,6 +124,171 @@ def calculer_montant_demande(type_analyse: str, categorie: str, priorite: str, e
     return montant_ht, montant_ttc
 
 
+def creer_devis_et_proforma(client, type_analyse, categorie, objet, description, priorite, echantillons):
+    """Cree une DemandeDevis + sa Proforma associee (montant calcule et fige).
+    Factorise entre DemandeDevisViewSet.perform_create (client authentifie) et
+    PublicDevisCreateView (formulaire public, compte cree a la volee)."""
+    last_id = DemandeDevis.objects.count() + 1
+    numero = f"DEV-{last_id:05d}"
+    while DemandeDevis.objects.filter(numero=numero).exists():
+        last_id += 1
+        numero = f"DEV-{last_id:05d}"
+
+    demande = DemandeDevis.objects.create(
+        client=client, numero=numero, type_analyse=type_analyse,
+        categorie=categorie, objet=objet, description=description,
+    )
+    EchantillonPrevu.objects.bulk_create([
+        EchantillonPrevu(demande=demande, nom=(e.get("nom") or "").strip() or "Échantillon", quantite=e.get("quantite") or 1)
+        for e in (echantillons or [])
+    ])
+
+    montant_ht, montant_ttc = calculer_montant_demande(
+        type_analyse=type_analyse, categorie=categorie, priorite=priorite, echantillons=echantillons,
+    )
+
+    suffixe = numero.split("-")[-1]
+    proforma_numero = f"PROF-{suffixe}"
+    if Proforma.objects.filter(numero=proforma_numero).exists():
+        last_proforma_id = Proforma.objects.count() + 1
+        proforma_numero = f"PROF-{last_proforma_id:05d}"
+    proforma = Proforma.objects.create(
+        numero=proforma_numero, client=client, montant_ht=montant_ht, montant_ttc=montant_ttc,
+        devise="FCFA", statut="BROUILLON", demande_devis=demande,
+    )
+    return demande, proforma
+
+
+def _generer_mot_de_passe():
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(10))
+
+
+def _generer_username(email, first_name="", raison_sociale=""):
+    base = email.split("@")[0] if email else (raison_sociale.lower().replace(" ", "_") or "client")
+    candidate = base
+    index = 1
+    while User.objects.filter(username=candidate).exists():
+        candidate = f"{base}{index}"
+        index += 1
+    return candidate
+
+
+class PublicDevisCreateView(APIView):
+    """Formulaire public (sans authentification) de demande de devis — cf.
+    refonte du parcours client : le client remplit directement le formulaire
+    (essais/analyses ou metrologie), son compte client est cree automatiquement
+    et ses identifiants lui sont envoyes par email."""
+
+    permission_classes = [permissions.AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        data = request.data or {}
+        email = str(data.get("email", "")).strip().lower()
+        if not email:
+            return Response({"detail": "L'adresse email est requise."}, status=status.HTTP_400_BAD_REQUEST)
+
+        type_analyse = str(data.get("type_analyse", "")).strip()
+        categorie = str(data.get("categorie", "")).strip()
+        objet = str(data.get("objet", "")).strip()
+        description = str(data.get("description", "")).strip()
+        priorite = str(data.get("priorite", "NORMALE")).strip()
+        echantillons = data.get("echantillons") or []
+        if not type_analyse or not objet:
+            return Response({"detail": "Type d'analyse et objet requis."}, status=status.HTTP_400_BAD_REQUEST)
+
+        first_name = str(data.get("first_name", "")).strip()
+        last_name = str(data.get("last_name", "")).strip()
+        raison_sociale = str(data.get("raison_sociale", "")).strip()
+        telephone = str(data.get("telephone", "")).strip()
+        domaine_activite = str(data.get("domaine_activite", "")).strip()
+        situation_geographique = str(data.get("situation_geographique", "")).strip()
+
+        user = User.objects.filter(email__iexact=email).first()
+        compte_cree = False
+        mot_de_passe = None
+
+        if user is None:
+            compte_cree = True
+            mot_de_passe = _generer_mot_de_passe()
+            username = _generer_username(email, first_name, raison_sociale)
+            user = User(username=username, email=email, first_name=first_name, last_name=last_name)
+            user.set_password(mot_de_passe)
+            user.save()
+            ClientProfile.objects.create(
+                user=user, role="CLIENT", raison_sociale=raison_sociale,
+                telephone=telephone, contact_nom=f"{first_name} {last_name}".strip(),
+                domaine_activite=domaine_activite, situation_geographique=situation_geographique,
+            )
+        else:
+            # Compte deja existant (demande precedente) : on complete le profil
+            # s'il manque des informations, sans toucher au mot de passe.
+            profile, _ = ClientProfile.objects.get_or_create(user=user, defaults={"role": "CLIENT"})
+            updated_fields = []
+            if domaine_activite and not profile.domaine_activite:
+                profile.domaine_activite = domaine_activite
+                updated_fields.append("domaine_activite")
+            if situation_geographique and not profile.situation_geographique:
+                profile.situation_geographique = situation_geographique
+                updated_fields.append("situation_geographique")
+            if raison_sociale and not profile.raison_sociale:
+                profile.raison_sociale = raison_sociale
+                updated_fields.append("raison_sociale")
+            if telephone and not profile.telephone:
+                profile.telephone = telephone
+                updated_fields.append("telephone")
+            if updated_fields:
+                profile.save(update_fields=updated_fields)
+
+        demande, proforma = creer_devis_et_proforma(
+            client=user, type_analyse=type_analyse, categorie=categorie, objet=objet,
+            description=description, priorite=priorite, echantillons=echantillons,
+        )
+
+        espace_url = f"{getattr(settings, 'FRONTEND_BASE_URL', 'https://e-services.lanema-ci.com')}/devis/connexion"
+        if compte_cree:
+            subject = "Votre compte client LANEMA et votre demande de devis"
+            message = (
+                f"Bonjour {first_name or ''},\n\n"
+                f"Votre demande de devis {demande.numero} a bien ete enregistree aupres du laboratoire LANEMA.\n\n"
+                "Un espace client a ete cree automatiquement pour vous permettre de suivre votre dossier :\n"
+                f"  - Identifiant (email) : {email}\n"
+                f"  - Mot de passe : {mot_de_passe}\n\n"
+                f"Connectez-vous ici : {espace_url}\n\n"
+                "Nous vous recommandons de changer ce mot de passe depuis votre profil des votre premiere connexion.\n\n"
+                "L'equipe LANEMA"
+            )
+        else:
+            subject = "Nouvelle demande de devis enregistree"
+            message = (
+                f"Bonjour {first_name or ''},\n\n"
+                f"Votre demande de devis {demande.numero} a bien ete enregistree aupres du laboratoire LANEMA.\n\n"
+                f"Suivez son avancement depuis votre espace client : {espace_url}\n\n"
+                "L'equipe LANEMA"
+            )
+        try:
+            send_mail(
+                subject=subject, message=message,
+                from_email=getattr(settings, "DEFAULT_FROM_EMAIL", None),
+                recipient_list=[email], fail_silently=True,
+            )
+        except Exception:
+            pass
+
+        return Response({
+            "numero": demande.numero,
+            "montant_ht": str(proforma.montant_ht),
+            "montant_ttc": str(proforma.montant_ttc),
+            "email": email,
+            "telephone": telephone,
+            "compte_cree": compte_cree,
+            "mot_de_passe": mot_de_passe,
+            "code_client": getattr(getattr(user, "client_profile", None), "code_client", None),
+            "espace_url": espace_url,
+        }, status=status.HTTP_201_CREATED)
+
+
 class DemandeDevisViewSet(viewsets.ModelViewSet):
     queryset = DemandeDevis.objects.select_related("client").all()
     serializer_class = DemandeDevisSerializer
@@ -139,6 +310,10 @@ class DemandeDevisViewSet(viewsets.ModelViewSet):
         categorie = serializer.validated_data.get("categorie", "")
         priorite = serializer.initial_data.get("priorite", "NORMALE")
         echantillons = serializer.initial_data.get("echantillons", [])
+        EchantillonPrevu.objects.bulk_create([
+            EchantillonPrevu(demande=demande, nom=(e.get("nom") or "").strip() or "Échantillon", quantite=e.get("quantite") or 1)
+            for e in (echantillons or [])
+        ])
 
         montant_ht, montant_ttc = calculer_montant_demande(
             type_analyse=type_analyse,

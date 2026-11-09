@@ -17,6 +17,7 @@ class ClientProfile(models.Model):
         ("CLIENT", "Client"),
         ("FOURNISSEUR", "Fournisseur"),
         ("COMPTABLE", "Comptable"),
+        ("RECEPTION", "Service Réception"),
     ]
 
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="client_profile")
@@ -32,6 +33,13 @@ class ClientProfile(models.Model):
     contact_nom = models.CharField(max_length=255, blank=True)
     expo_push_token = models.CharField(max_length=255, blank=True, null=True)
 
+    # Champs du formulaire officiel de devis (EN 002-PG002) : le code client
+    # anonymise le client aupres du laboratoire (sa raison sociale n'y circule
+    # pas) et identifie ses echantillons/fiches tout au long du circuit.
+    code_client = models.CharField(max_length=20, unique=True, blank=True, null=True)
+    domaine_activite = models.CharField(max_length=255, blank=True)
+    situation_geographique = models.CharField(max_length=255, blank=True)
+
     # Signature et cachet du responsable labo (roles ADMIN/GESTIONNAIRE), reutilises
     # pour valider les devis, bons de commande et factures sans les redemander a chaque fois.
     signature_image = models.ImageField(upload_to="clients/signatures_responsable/", null=True, blank=True)
@@ -39,6 +47,28 @@ class ClientProfile(models.Model):
 
     def __str__(self) -> str:  # pragma: no cover - simple repr
         return f"{self.user.username} ({self.role})"
+
+    def save(self, *args, **kwargs):
+        if not self.code_client:
+            # Reprend la numerotation existante (dernier code attribue
+            # manuellement avant la mise en place de cette generation
+            # automatique : LANCL982) et continue a partir de la.
+            last = (
+                ClientProfile.objects.exclude(code_client__isnull=True)
+                .exclude(code_client="")
+                .order_by("-id")
+                .values_list("code_client", flat=True)
+            )
+            max_num = 982
+            for code in last:
+                try:
+                    num = int(str(code).replace("LANCL", ""))
+                except ValueError:
+                    continue
+                if num > max_num:
+                    max_num = num
+            self.code_client = f"LANCL{max_num + 1}"
+        super().save(*args, **kwargs)
 
 
 class LaboRolePermission(models.Model):

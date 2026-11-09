@@ -1,10 +1,21 @@
 from rest_framework import serializers
 
-from .models import ActionQualite, Audit, Echantillon, Essai, NonConformite, RecommandationAudit
+from .models import (
+    ActionQualite,
+    Audit,
+    Echantillon,
+    Essai,
+    FicheEntreeEquipement,
+    NonConformite,
+    RecommandationAudit,
+)
 
 
 class EchantillonSerializer(serializers.ModelSerializer):
     demande_numero = serializers.CharField(source='demande.numero', read_only=True)
+    code_client = serializers.CharField(
+        source='demande.demande_devis.client.client_profile.code_client', read_only=True, default=None
+    )
 
     class Meta:
         model = Echantillon
@@ -15,6 +26,7 @@ class EchantillonSerializer(serializers.ModelSerializer):
             "type_echantillon",
             "demande",
             "demande_numero",
+            "code_client",
             "quantite",
             "statut",
             "conforme",
@@ -25,6 +37,25 @@ class EchantillonSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = ["id", "code_echantillon", "created_at", "updated_at"]
+
+
+class FicheEntreeEquipementSerializer(serializers.ModelSerializer):
+    demande_devis_numero = serializers.CharField(source='demande_devis.numero', read_only=True, default=None)
+    demande_dae_reference = serializers.CharField(source='demande_dae.reference', read_only=True, default=None)
+    code_client = serializers.CharField(
+        source='demande_devis.client.client_profile.code_client', read_only=True, default=None
+    )
+    recu_par_nom = serializers.CharField(source='recu_par.get_full_name', read_only=True, default=None)
+
+    class Meta:
+        model = FicheEntreeEquipement
+        fields = [
+            "id", "code", "domaine", "demande_devis", "demande_devis_numero", "demande_dae",
+            "demande_dae_reference", "code_client", "designation", "marque", "modele", "numero_serie",
+            "etat_reception", "statut", "date_reception", "recu_par", "recu_par_nom", "observations",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "code", "created_at", "updated_at"]
 
 
 class NonConformiteSerializer(serializers.ModelSerializer):

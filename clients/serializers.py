@@ -36,7 +36,11 @@ class ClientProfileSerializer(serializers.ModelSerializer):
             "is_active",
             "signature_image",
             "cachet_image",
+            "code_client",
+            "domaine_activite",
+            "situation_geographique",
         ]
+        read_only_fields = ["code_client"]
 
     def create(self, validated_data):
         user_data = validated_data.pop("user", {})
@@ -98,6 +102,8 @@ class RegisterSerializer(serializers.ModelSerializer):
             "telephone",
             "siret",
             "contact_nom",
+            "domaine_activite",
+            "situation_geographique",
         ]
         extra_kwargs = {
             "role": {"required": False},
@@ -108,6 +114,8 @@ class RegisterSerializer(serializers.ModelSerializer):
             "telephone": {"required": False},
             "siret": {"required": False},
             "contact_nom": {"required": False},
+            "domaine_activite": {"required": False},
+            "situation_geographique": {"required": False},
         }
 
     def create(self, validated_data):

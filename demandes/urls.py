@@ -1,7 +1,13 @@
 from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
-from .views import DemandeDevisViewSet, DemandesDashboardStatsView, TypesAnalyseView, DemandesSimpleView
+from .views import (
+    DemandeDevisViewSet,
+    DemandesDashboardStatsView,
+    DemandesSimpleView,
+    PublicDevisCreateView,
+    TypesAnalyseView,
+)
 
 
 router = DefaultRouter()
@@ -9,6 +15,7 @@ router.register(r"devis", DemandeDevisViewSet, basename="demande-devis")
 
 
 urlpatterns = [
+    path("devis/public/", PublicDevisCreateView.as_view(), name="demande-devis-public"),
     path("", include(router.urls)),
     path("dashboard/stats/", DemandesDashboardStatsView.as_view(), name="demandes-dashboard-stats"),
     path("types-analyse/", TypesAnalyseView.as_view(), name="types-analyse"),

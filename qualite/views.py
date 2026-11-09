@@ -6,12 +6,13 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import ActionQualite, Audit, Echantillon, Essai, NonConformite, RecommandationAudit
+from .models import ActionQualite, Audit, Echantillon, Essai, FicheEntreeEquipement, NonConformite, RecommandationAudit
 from .serializers import (
     ActionQualiteSerializer,
     AuditSerializer,
     EchantillonSerializer,
     EssaiSerializer,
+    FicheEntreeEquipementSerializer,
     NonConformiteSerializer,
     RecommandationAuditSerializer,
 )
@@ -40,10 +41,14 @@ class EchantillonViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         self._check_labo_staff()
         demande = serializer.validated_data.get("demande")
-        if demande is not None and (demande.facture is None or demande.facture.statut != "PAYEE"):
-            raise ValidationError(
-                {"detail": "Le paiement doit être validé avant la réception des échantillons."}
-            )
+        if demande is not None:
+            facture = demande.facture
+            bon_commande_signe = bool(facture and facture.bon_commande_id and facture.bon_commande.statut == "SIGNE_CLIENT")
+            paiement_valide = bool(facture and facture.statut == "PAYEE")
+            if not (bon_commande_signe or paiement_valide):
+                raise ValidationError(
+                    {"detail": "Le devis doit être signé par le client (bon pour accord) avant la réception des échantillons."}
+                )
         serializer.save()
 
         # Enregistrer un echantillon vaut confirmation de sa reception : on
@@ -61,6 +66,31 @@ class EchantillonViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         self._check_labo_staff()
         instance.delete()
+
+
+class FicheEntreeEquipementViewSet(viewsets.ModelViewSet):
+    """Fiches d'entree des equipements/instruments pour metrologie et
+    aeronautique — pendant du EchantillonViewSet pour du materiel plutot
+    que des echantillons consommables (cf. qualite.models.FicheEntreeEquipement)."""
+
+    queryset = FicheEntreeEquipement.objects.select_related(
+        "demande_devis__client__client_profile", "demande_dae", "recu_par"
+    ).all()
+    serializer_class = FicheEntreeEquipementSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        domaine = self.request.query_params.get('domaine')
+        if domaine:
+            queryset = queryset.filter(domaine=domaine)
+        statut = self.request.query_params.get('statut')
+        if statut and statut != 'TOUS':
+            queryset = queryset.filter(statut=statut)
+        return queryset
+
+    def perform_create(self, serializer):
+        serializer.save(recu_par=self.request.user)
 
 
 class NonConformiteViewSet(viewsets.ModelViewSet):

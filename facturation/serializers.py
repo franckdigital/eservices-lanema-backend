@@ -145,6 +145,11 @@ class DemandeAnalyseSerializer(serializers.ModelSerializer):
     facture_numero = serializers.CharField(source="facture.numero", read_only=True, default=None)
     laboratoire_nom = serializers.CharField(source="laboratoire.nom", read_only=True, default=None)
     paiement_effectue = serializers.SerializerMethodField(read_only=True)
+    bon_commande_signe = serializers.SerializerMethodField(read_only=True)
+    code_client = serializers.CharField(source="client.client_profile.code_client", read_only=True, default=None)
+    objet = serializers.CharField(source="demande_devis.objet", read_only=True, default=None)
+    type_analyse = serializers.CharField(source="demande_devis.type_analyse", read_only=True, default=None)
+    echantillons_prevus = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = DemandeAnalyse
@@ -152,7 +157,10 @@ class DemandeAnalyseSerializer(serializers.ModelSerializer):
             "id",
             "numero",
             "client",
+            "code_client",
             "demande_devis",
+            "objet",
+            "type_analyse",
             "proforma",
             "facture",
             "facture_numero",
@@ -169,6 +177,8 @@ class DemandeAnalyseSerializer(serializers.ModelSerializer):
             "date_fin_analyse",
             "observations",
             "paiement_effectue",
+            "bon_commande_signe",
+            "echantillons_prevus",
         ]
         read_only_fields = [
             "id",
@@ -184,3 +194,14 @@ class DemandeAnalyseSerializer(serializers.ModelSerializer):
         # La facture est desormais directement rattachee a la demande d'analyse
         # (chainage explicite), plus besoin d'heuristique client+montant.
         return obj.facture is not None and obj.facture.statut == "PAYEE"
+
+    def get_bon_commande_signe(self, obj):
+        return bool(obj.facture and obj.facture.bon_commande_id and obj.facture.bon_commande.statut == "SIGNE_CLIENT")
+
+    def get_echantillons_prevus(self, obj):
+        if obj.demande_devis_id is None:
+            return []
+        return [
+            {"id": e.id, "nom": e.nom, "quantite": e.quantite}
+            for e in obj.demande_devis.echantillons_prevus.all()
+        ]

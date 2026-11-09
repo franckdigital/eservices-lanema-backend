@@ -8,6 +8,7 @@ from .views import (
     EchantillonViewSet,
     EssaisKPIView,
     EssaiViewSet,
+    FicheEntreeEquipementViewSet,
     NonConformiteViewSet,
     QualiteDashboardStatsView,
     QualiteIsoKPIView,
@@ -20,6 +21,7 @@ router = DefaultRouter()
 router.register(r"non-conformites", NonConformiteViewSet, basename="non-conformite")
 router.register(r"audits", AuditViewSet, basename="audit")
 router.register(r"echantillons", EchantillonViewSet, basename="echantillon")
+router.register(r"fiches-entree-equipement", FicheEntreeEquipementViewSet, basename="fiche-entree-equipement")
 router.register(r"essais", EssaiViewSet, basename="essai")
 router.register(r"actions-qualite", ActionQualiteViewSet, basename="action-qualite-labo")
 router.register(r"recommandations-audit", RecommandationAuditViewSet, basename="recommandation-audit")

@@ -656,6 +656,7 @@ class UserProfileView(APIView):
             'CLIENT': 'Client',
             'FOURNISSEUR': 'Fournisseur',
             'COMPTABLE': 'Comptable',
+            'RECEPTION': 'Service Réception',
         }
         return role_mapping.get(role, role)
 

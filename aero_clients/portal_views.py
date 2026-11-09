@@ -4,9 +4,14 @@ dossier, consulter l'état de l'intervention, télécharger rapports/certificats
 consulter ses factures, donner une note, déposer une réclamation — sans
 compte staff. Auth JWT dédiée (email + mot de passe), distincte de
 core.UserProfile (staff) et de clients.ClientProfile (portail labo)."""
+import secrets
+import string
+
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.core.mail import send_mail
 from django.utils import timezone
 from rest_framework import permissions, serializers, status, viewsets
 from rest_framework.decorators import action
@@ -84,6 +89,131 @@ class ClientPortalRegisterView(APIView):
         return Response({
             "tokens": {"access": str(refresh.access_token), "refresh": str(refresh)},
             "client": ClientPortalProfileSerializer(client).data,
+        }, status=status.HTTP_201_CREATED)
+
+
+def _generer_mot_de_passe():
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(10))
+
+
+def _generer_username(email, nom=""):
+    base = email.split("@")[0] if email else (nom.lower().replace(" ", "_") or "client-dae")
+    candidate = base
+    index = 1
+    while User.objects.filter(username=candidate).exists():
+        candidate = f"{base}{index}"
+        index += 1
+    return candidate
+
+
+class PublicDAEDemandeView(APIView):
+    """Formulaire public (sans authentification) de demande d'intervention DAE
+    — cree automatiquement le compte client aeronautique (ou reutilise celui
+    existant pour cet email) et la demande, puis envoie les identifiants
+    par email. Cf. refonte du parcours de demande de devis."""
+
+    permission_classes = [permissions.AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        data = request.data or {}
+        email = str(data.get("email", "")).strip().lower()
+        nom = str(data.get("nom", "")).strip()
+        if not email or not nom:
+            return Response({"detail": "Email et raison sociale requis."}, status=status.HTTP_400_BAD_REQUEST)
+
+        type_intervention = str(data.get("type_intervention", "CORRECTIVE")).strip() or "CORRECTIVE"
+        description = str(data.get("description", "")).strip()
+        urgence = str(data.get("urgence", "NORMALE")).strip() or "NORMALE"
+        telephone = str(data.get("telephone", "")).strip()
+        adresse = str(data.get("adresse", "")).strip()
+        contact = str(data.get("contact", "")).strip()
+        type_client = str(data.get("type_client", "AUTRE")).strip() or "AUTRE"
+        numero_identification = str(data.get("numero_identification", "")).strip()
+
+        user = User.objects.filter(email__iexact=email).first()
+        client = get_client_aeronautique(user) if user else None
+        compte_cree = False
+        mot_de_passe = None
+
+        if client is None:
+            if ClientAeronautique.objects.filter(nom=nom).exists():
+                return Response(
+                    {"detail": "Un client aéronautique porte déjà ce nom. Contactez la DAE pour rattacher votre compte."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if user is None:
+                compte_cree = True
+                mot_de_passe = _generer_mot_de_passe()
+                username = _generer_username(email, nom)
+                user = User.objects.create_user(username=username, email=email, password=mot_de_passe)
+            client = ClientAeronautique.objects.create(
+                nom=nom, type_client=type_client, adresse=adresse, telephone=telephone,
+                email=email, numero_identification=numero_identification, contact=contact,
+                compte_utilisateur=user,
+            )
+
+        aeronef = None
+        immatriculation = str(data.get("immatriculation", "")).strip()
+        if immatriculation:
+            aeronef, _ = Aeronef.objects.get_or_create(
+                immatriculation=immatriculation,
+                defaults={
+                    "type_aeronef": str(data.get("type_aeronef", "")).strip(),
+                    "constructeur": str(data.get("constructeur", "")).strip(),
+                    "modele": str(data.get("modele", "")).strip(),
+                    "client": client,
+                },
+            )
+
+        last_id = DemandeDAE.objects.count() + 1
+        reference = f"DEM-DAE-{timezone.now().year}-{last_id:05d}"
+        while DemandeDAE.objects.filter(reference=reference).exists():
+            last_id += 1
+            reference = f"DEM-DAE-{timezone.now().year}-{last_id:05d}"
+        demande = DemandeDAE.objects.create(
+            reference=reference, client=client, aeronef=aeronef, type_intervention=type_intervention,
+            description=description, urgence=urgence,
+        )
+
+        espace_url = f"{getattr(settings, 'FRONTEND_BASE_URL', 'https://e-services.lanema-ci.com')}/dae-client/login"
+        if compte_cree:
+            subject = "Votre espace client DAE LANEMA et votre demande"
+            message = (
+                f"Bonjour,\n\n"
+                f"Votre demande {demande.reference} a bien ete enregistree aupres de la Direction de l'Aeronautique (DAE) LANEMA.\n\n"
+                "Un espace client a ete cree automatiquement pour vous permettre de suivre votre dossier :\n"
+                f"  - Identifiant (email) : {email}\n"
+                f"  - Mot de passe : {mot_de_passe}\n\n"
+                f"Connectez-vous ici : {espace_url}\n\n"
+                "Nous vous recommandons de changer ce mot de passe depuis votre profil des votre premiere connexion.\n\n"
+                "L'equipe DAE - LANEMA"
+            )
+        else:
+            subject = "Nouvelle demande DAE enregistree"
+            message = (
+                f"Bonjour,\n\n"
+                f"Votre demande {demande.reference} a bien ete enregistree aupres de la DAE LANEMA.\n\n"
+                f"Suivez son avancement depuis votre espace client : {espace_url}\n\n"
+                "L'equipe DAE - LANEMA"
+            )
+        try:
+            send_mail(
+                subject=subject, message=message,
+                from_email=getattr(settings, "DEFAULT_FROM_EMAIL", None),
+                recipient_list=[email], fail_silently=True,
+            )
+        except Exception:
+            pass
+
+        return Response({
+            "reference": demande.reference,
+            "email": email,
+            "telephone": telephone,
+            "compte_cree": compte_cree,
+            "mot_de_passe": mot_de_passe,
+            "espace_url": espace_url,
         }, status=status.HTTP_201_CREATED)
 
 

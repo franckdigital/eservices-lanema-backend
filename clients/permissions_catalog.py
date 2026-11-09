@@ -79,6 +79,17 @@ DEFAULT_ROLE_PERMISSIONS = {
         "reporting.view",
         "notifications.view",
     ],
+    "RECEPTION": [
+        # Service reception : signature "bon pour accord" des devis, reception
+        # des echantillons/equipements et transmission au laboratoire (cf.
+        # pages/app/StaffReception.js) — perimetre volontairement restreint,
+        # sans acces a la facturation, au stock ni a l'administration.
+        "dashboard.view",
+        "clients.view",
+        "echantillons.view", "echantillons.manage",
+        "qualite.view",
+        "notifications.view",
+    ],
 }
 
 

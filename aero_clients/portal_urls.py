@@ -12,6 +12,7 @@ from .portal_views import (
     ClientPortalReclamationViewSet,
     ClientPortalRegisterView,
     ClientPortalSatisfactionView,
+    PublicDAEDemandeView,
 )
 
 router = DefaultRouter()
@@ -23,6 +24,7 @@ router.register(r"reclamations", ClientPortalReclamationViewSet, basename="porta
 
 urlpatterns = [
     path("auth/register/", ClientPortalRegisterView.as_view(), name="portal-register"),
+    path("auth/demande-publique/", PublicDAEDemandeView.as_view(), name="portal-public-demande"),
     path("auth/login/", ClientPortalLoginView.as_view(), name="portal-login"),
     path("auth/profile/", ClientPortalProfileView.as_view(), name="portal-profile"),
     path("dashboard/", ClientPortalDashboardView.as_view(), name="portal-dashboard"),

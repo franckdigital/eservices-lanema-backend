@@ -73,6 +73,70 @@ class Echantillon(models.Model):
         super().save(*args, **kwargs)
 
 
+class FicheEntreeEquipement(models.Model):
+    """Fiche d'entree des equipements/instruments recus au service reception
+    pour la metrologie (etalonnage) ou l'aeronautique — mecanisme volontairement
+    simple et generique, a personnaliser plus tard par domaine. Pendant de
+    Echantillon (essais/analyses), mais pour du materiel client au lieu
+    d'echantillons consommables."""
+
+    DOMAINE_CHOICES = [
+        ("METROLOGIE", "Métrologie"),
+        ("AERONAUTIQUE", "Aéronautique"),
+    ]
+    STATUT_CHOICES = [
+        ("RECEPTIONNE", "Réceptionné"),
+        ("TRANSMIS_LABO", "Transmis au laboratoire/atelier"),
+        ("EN_COURS", "En cours"),
+        ("TERMINE", "Terminé"),
+        ("RESTITUE", "Restitué au client"),
+    ]
+
+    code = models.CharField(max_length=100, unique=True)
+    domaine = models.CharField(max_length=20, choices=DOMAINE_CHOICES)
+    demande_devis = models.ForeignKey(
+        "demandes.DemandeDevis", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="fiches_entree_equipement", help_text="Pour une fiche du domaine METROLOGIE",
+    )
+    demande_dae = models.ForeignKey(
+        "aero_clients.DemandeDAE", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="fiches_entree_equipement", help_text="Pour une fiche du domaine AERONAUTIQUE",
+    )
+    designation = models.CharField(max_length=255)
+    marque = models.CharField(max_length=255, blank=True)
+    modele = models.CharField(max_length=255, blank=True)
+    numero_serie = models.CharField(max_length=100, blank=True)
+    etat_reception = models.CharField(max_length=255, blank=True, help_text="Etat constate a la reception")
+    statut = models.CharField(max_length=20, choices=STATUT_CHOICES, default="RECEPTIONNE")
+    date_reception = models.DateField()
+    recu_par = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    observations = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:  # pragma: no cover
+        return self.code
+
+    def save(self, *args, **kwargs):
+        if not self.code:
+            from django.utils import timezone
+            today = timezone.now()
+            prefix = f"FE-{today.strftime('%Y%m%d')}"
+            last = FicheEntreeEquipement.objects.filter(code__startswith=prefix).order_by('-code').first()
+            if last:
+                try:
+                    num = int(last.code.split('-')[-1]) + 1
+                except Exception:
+                    num = 1
+            else:
+                num = 1
+            self.code = f"{prefix}-{num:03d}"
+        super().save(*args, **kwargs)
+
+
 class Essai(models.Model):
     """Modèle pour les essais/analyses du laboratoire"""
     STATUT_CHOICES = [

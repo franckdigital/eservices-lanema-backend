@@ -514,6 +514,14 @@ class BonCommandeViewSet(viewsets.ModelViewSet):
             "signature_client_image", "date_signature_client", "statut",
         ])
 
+        # Le bon de commande signe ("lu et approuve" / "bon pour accord")
+        # vaut validation du devis par le client : le service reception peut
+        # des lors receptionner les echantillons annonces, sans attendre le
+        # paiement de la facture (cf. qualite.EchantillonViewSet.perform_create).
+        facture = Facture.objects.filter(bon_commande=bon_commande).first()
+        if facture is not None:
+            _creer_demande_analyse_si_absente(facture)
+
         serializer = self.get_serializer(bon_commande, context={"request": request})
         return Response(serializer.data)
 
@@ -1011,7 +1019,9 @@ class FacturationStatsView(APIView):
 
 
 class DemandeAnalyseViewSet(viewsets.ModelViewSet):
-    queryset = DemandeAnalyse.objects.select_related("client", "demande_devis", "proforma", "facture").all()
+    queryset = DemandeAnalyse.objects.select_related(
+        "client__client_profile", "demande_devis", "proforma", "facture__bon_commande"
+    ).prefetch_related("demande_devis__echantillons_prevus").all()
     serializer_class = DemandeAnalyseSerializer
     permission_classes = [permissions.IsAuthenticated]
 
@@ -1038,9 +1048,12 @@ class DemandeAnalyseViewSet(viewsets.ModelViewSet):
 
         if not user_has_permission(request.user, "echantillons.manage"):
             return Response({"detail": "Non autorisé"}, status=status.HTTP_403_FORBIDDEN)
-        if analyse.facture is None or analyse.facture.statut != "PAYEE":
+        facture = analyse.facture
+        bon_commande_signe = bool(facture and facture.bon_commande_id and facture.bon_commande.statut == "SIGNE_CLIENT")
+        paiement_valide = bool(facture and facture.statut == "PAYEE")
+        if not (bon_commande_signe or paiement_valide):
             return Response(
-                {"detail": "Le paiement doit être validé avant la réception des échantillons."},
+                {"detail": "Le devis doit être signé par le client (bon pour accord) avant la réception des échantillons."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         if analyse.statut != "EN_ATTENTE_ECHANTILLONS":
