@@ -15,7 +15,13 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import CreneauDisponibilite, DemandeDevis, EchantillonPrevu, SousTraitantPartenaire
+from .models import (
+    CreneauDisponibilite,
+    DemandeDevis,
+    EchantillonPrevu,
+    InterventionPrelevement,
+    SousTraitantPartenaire,
+)
 from .serializers import CreneauDisponibiliteSerializer, DemandeDevisSerializer, SousTraitantPartenaireSerializer
 from clients.models import ClientProfile
 from clients.permissions_catalog import user_has_permission
@@ -96,6 +102,16 @@ PRIORITE_COEFFICIENTS = {
 }
 
 
+def prix_unitaire_demande(type_analyse: str, categorie: str, priorite: str) -> Decimal:
+    """Prix unitaire par echantillon/parametre, utilise pour figer la colonne
+    P.U. de chaque ligne EchantillonPrevu (cf. formulaire EN 002-PG002,
+    tableau "Paramètres ou Grandeurs")."""
+    base = PRICING_BASE_TYPE.get(type_analyse, Decimal("0"))
+    supplement = PRICING_SUPPLEMENTS.get(type_analyse, {}).get(categorie, Decimal("0"))
+    coeff = PRIORITE_COEFFICIENTS.get(priorite or "NORMALE", Decimal("1.0"))
+    return (base + supplement) * coeff
+
+
 def calculer_montant_demande(type_analyse: str, categorie: str, priorite: str, echantillons) -> tuple[Decimal, Decimal]:
     """Calcule montant HT et TTC pour une demande de devis.
 
@@ -146,6 +162,8 @@ def delai_actuel():
 def creer_devis_et_proforma(
     client, type_analyse, categorie, objet, description, priorite, echantillons,
     accord_sous_traitance=False, sous_traitants_ids=None, sous_traitants_libres="",
+    retour_materiel_gere_labo=None, lieu_realisation="LABORATOIRE",
+    observations_particulieres="", declaration_conformite_souhaitee=None,
 ):
     """Cree une DemandeDevis + sa Proforma associee (montant calcule et fige).
     Factorise entre DemandeDevisViewSet.perform_create (client authentifie) et
@@ -163,13 +181,21 @@ def creer_devis_et_proforma(
         delai_realisation_jours=creneau.delai_jours_ouvres if creneau else None,
         accord_sous_traitance=bool(accord_sous_traitance),
         sous_traitants_souhaits_libres=sous_traitants_libres or "",
+        retour_materiel_gere_labo=retour_materiel_gere_labo,
+        lieu_realisation=lieu_realisation or "LABORATOIRE",
+        observations_particulieres=observations_particulieres or "",
+        declaration_conformite_souhaitee=declaration_conformite_souhaitee,
     )
     if sous_traitants_ids:
         demande.sous_traitants_choisis.set(
             SousTraitantPartenaire.objects.filter(id__in=sous_traitants_ids)
         )
+    pu = prix_unitaire_demande(type_analyse, categorie, priorite)
     EchantillonPrevu.objects.bulk_create([
-        EchantillonPrevu(demande=demande, nom=(e.get("nom") or "").strip() or "Échantillon", quantite=e.get("quantite") or 1)
+        EchantillonPrevu(
+            demande=demande, nom=(e.get("nom") or "").strip() or "Échantillon", quantite=e.get("quantite") or 1,
+            prix_unitaire=pu,
+        )
         for e in (echantillons or [])
     ])
 
@@ -239,6 +265,7 @@ class PublicDevisCreateView(APIView):
         telephone = str(data.get("telephone", "")).strip()
         domaine_activite = str(data.get("domaine_activite", "")).strip()
         situation_geographique = str(data.get("situation_geographique", "")).strip()
+        adresse = str(data.get("adresse", "")).strip()
 
         accord_sous_traitance = str(data.get("accord_sous_traitance", "")).lower() in ("true", "1", "on")
         sous_traitants_libres = str(data.get("sous_traitants_libres", "")).strip()
@@ -249,6 +276,18 @@ class PublicDevisCreateView(APIView):
             except (TypeError, ValueError):
                 sous_traitants_raw = []
         sous_traitants_ids = [i for i in (sous_traitants_raw or []) if i not in (None, "")]
+
+        lieu_realisation = str(data.get("lieu_realisation", "LABORATOIRE")).strip() or "LABORATOIRE"
+        observations_particulieres = str(data.get("observations_particulieres", "")).strip()
+
+        def _parse_bool_optionnel(key):
+            raw = data.get(key)
+            if raw in (None, ""):
+                return None
+            return str(raw).lower() in ("true", "1", "on", "oui")
+
+        retour_materiel_gere_labo = _parse_bool_optionnel("retour_materiel_gere_labo")
+        declaration_conformite_souhaitee = _parse_bool_optionnel("declaration_conformite_souhaitee")
 
         signature = request.FILES.get("signature_client_image")
 
@@ -267,6 +306,7 @@ class PublicDevisCreateView(APIView):
                 user=user, role="CLIENT", raison_sociale=raison_sociale,
                 telephone=telephone, contact_nom=f"{first_name} {last_name}".strip(),
                 domaine_activite=domaine_activite, situation_geographique=situation_geographique,
+                adresse=adresse,
             )
         else:
             # Compte deja existant (demande precedente) : on complete le profil
@@ -285,12 +325,18 @@ class PublicDevisCreateView(APIView):
             if telephone and not profile.telephone:
                 profile.telephone = telephone
                 updated_fields.append("telephone")
+            if adresse and not profile.adresse:
+                profile.adresse = adresse
+                updated_fields.append("adresse")
             if updated_fields:
                 profile.save(update_fields=updated_fields)
 
         demande, proforma = creer_devis_et_proforma(
             client=user, type_analyse=type_analyse, categorie=categorie, objet=objet,
             description=description, priorite=priorite, echantillons=echantillons,
+            retour_materiel_gere_labo=retour_materiel_gere_labo, lieu_realisation=lieu_realisation,
+            observations_particulieres=observations_particulieres,
+            declaration_conformite_souhaitee=declaration_conformite_souhaitee,
             accord_sous_traitance=accord_sous_traitance, sous_traitants_ids=sous_traitants_ids,
             sous_traitants_libres=sous_traitants_libres,
         )
@@ -525,6 +571,38 @@ class DemandeDevisViewSet(viewsets.ModelViewSet):
         demande = self.get_object()
         demande.statut = "ACCEPTEE"
         demande.save(update_fields=["statut"])
+        serializer = self.get_serializer(demande)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["post"], url_path="interventions_prelevement")
+    def definir_interventions_prelevement(self, request, pk=None):
+        """Renseigne (service reception) le tableau "2 - Prélèvement ou
+        récupération de l'appareil de mesure" du devis officiel : duree,
+        kilometrage, nombre et prix unitaire pour chacune des 5 designations
+        fixes. Le frontend envoie la liste complete a chaque enregistrement
+        (upsert par designation)."""
+
+        if not user_has_permission(request.user, "echantillons.manage"):
+            return Response({"detail": "Non autorisé"}, status=status.HTTP_403_FORBIDDEN)
+
+        demande = self.get_object()
+        lignes = request.data if isinstance(request.data, list) else request.data.get("lignes", [])
+        designations_valides = dict(InterventionPrelevement.DESIGNATION_CHOICES)
+
+        for ligne in lignes:
+            designation = ligne.get("designation")
+            if designation not in designations_valides:
+                continue
+            InterventionPrelevement.objects.update_or_create(
+                demande=demande, designation=designation,
+                defaults={
+                    "duree_heures": ligne.get("duree_heures") or None,
+                    "km": ligne.get("km") or None,
+                    "nombre": ligne.get("nombre") or 0,
+                    "prix_unitaire": ligne.get("prix_unitaire") or 0,
+                },
+            )
+
         serializer = self.get_serializer(demande)
         return Response(serializer.data)
 

@@ -190,10 +190,19 @@ def _draw_client_signature(canvas_obj, x, y, bon_commande):
     canvas_obj.setFillColor(colors.black)
 
 
+def _oui_non(value):
+    if value is None:
+        return "-"
+    return "Oui" if value else "Non"
+
+
 def _generer_proforma_pdf(proforma):
-    """Construit le PDF d'un devis (Proforma) et renvoie les octets bruts.
-    Reutilise par ProformaViewSet.telecharger_pdf (JSON base64) et
-    ProformaViewSet.envoyer_devis (piece jointe email)."""
+    """Construit le PDF du devis (Proforma), reproduisant fidelement le
+    formulaire officiel EN 002-PG002 (Reference, Informations client, tableau
+    des prestations, tableau de prelevement, accreditations, delais/sous-
+    traitance/declaration de conformite, signatures). Reutilise par
+    ProformaViewSet.telecharger_pdf (JSON base64) et .envoyer_devis (piece
+    jointe email)."""
 
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4
@@ -206,88 +215,233 @@ def _generer_proforma_pdf(proforma):
     width, height = A4
 
     primary = colors.HexColor("#0B57A4")
+    ink = colors.HexColor("#1e293b")
+    muted = colors.HexColor("#64748b")
+    LEFT, RIGHT = 16 * mm, width - 16 * mm
+    USABLE_W = RIGHT - LEFT
 
-    # Header
-    c.setFillColor(primary)
-    c.rect(0, height - 45 * mm, width, 45 * mm, fill=1, stroke=0)
-    c.setFillColor(colors.white)
-    c.setFont("Helvetica-Bold", 18)
-    c.drawString(18 * mm, height - 22 * mm, "LANEMA")
-    c.setFont("Helvetica-Bold", 14)
-    c.drawRightString(width - 18 * mm, height - 20 * mm, "DEVIS")
-    c.setFont("Helvetica", 10)
-    c.drawRightString(width - 18 * mm, height - 28 * mm, f"N° {proforma.numero}")
-    c.drawRightString(
-        width - 18 * mm,
-        height - 34 * mm,
-        f"Date: {proforma.date_emission.strftime('%d/%m/%Y') if proforma.date_emission else ''}",
-    )
-
-    # Client box
-    y = height - 58 * mm
-    c.setFillColor(colors.HexColor("#F3F6FB"))
-    c.roundRect(18 * mm, y - 25 * mm, width - 36 * mm, 22 * mm, 6, fill=1, stroke=0)
-    c.setFillColor(colors.black)
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(22 * mm, y - 9 * mm, "Client")
-    c.setFont("Helvetica", 10)
-    client_profile = getattr(proforma.client, "client_profile", None)
-    client_name = getattr(client_profile, "raison_sociale", "") or proforma.client.email
-    code_client = getattr(client_profile, "code_client", "") or ""
-    c.drawString(22 * mm, y - 15 * mm, f"{client_name}" + (f"  (Code : {code_client})" if code_client else ""))
-    c.drawString(22 * mm, y - 20 * mm, proforma.client.email)
-
-    # Table (simple, 1 ligne)
-    data = [["Description", "Tarif", "Qté", "Montant"]]
-    description = f"Prestations laboratoire - {proforma.demande_devis.numero if proforma.demande_devis else 'Demande'}"
-    data.append([description, "-", "1", f"{proforma.montant_ttc} {proforma.devise}"])
-
-    table = Table(data, colWidths=[90 * mm, 30 * mm, 20 * mm, 35 * mm])
-    table.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), primary),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("FONTSIZE", (0, 0), (-1, 0), 9),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#C9D7EE")),
-                ("FONTSIZE", (0, 1), (-1, -1), 9),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("BACKGROUND", (0, 1), (-1, -1), colors.white),
-            ]
-        )
-    )
-    table.wrapOn(c, width - 36 * mm, 100 * mm)
-    table.drawOn(c, 18 * mm, y - 60 * mm)
-
-    # Delai de realisation / sous-traitance, si la demande liee en porte
     demande = proforma.demande_devis
-    info_y = y - 72 * mm
-    if demande is not None:
-        c.setFont("Helvetica", 9)
-        c.setFillColor(colors.HexColor("#334155"))
-        if demande.delai_realisation_jours:
-            c.drawString(18 * mm, info_y, f"Délai de réalisation : {demande.delai_realisation_jours} jours ouvrés")
-            info_y -= 5 * mm
-        c.drawString(18 * mm, info_y, f"Accord de sous-traitance : {'Oui' if demande.accord_sous_traitance else 'Non'}")
-        c.setFillColor(colors.black)
+    client_profile = getattr(proforma.client, "client_profile", None)
 
-    # Totals
-    total_y = y - 110 * mm
-    c.setFont("Helvetica", 10)
-    c.drawRightString(width - 18 * mm, total_y, f"Sous total: {proforma.montant_ht} {proforma.devise}")
+    # ── Header ────────────────────────────────────────────────────────────
+    c.setFillColor(primary)
+    c.rect(0, height - 28 * mm, width, 28 * mm, fill=1, stroke=0)
+    c.setFillColor(colors.white)
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(LEFT, height - 13 * mm, "LANEMA")
+    c.setFont("Helvetica", 7)
+    c.drawString(LEFT, height - 18 * mm, "Laboratoire National d'Essais de Qualité, de Métrologie et d'Analyses")
+    c.setFont("Helvetica-Bold", 18)
+    c.drawRightString(RIGHT, height - 15 * mm, "DEVIS")
+    c.setFillColor(colors.black)
+
+    y = height - 34 * mm
+    c.setFont("Helvetica", 8)
+    c.setFillColor(ink)
+    direction_nom = (demande.type_analyse if demande else "") or ""
+    c.drawString(LEFT, y, f"Réf : {proforma.numero} / {proforma.date_emission.year if proforma.date_emission else ''} / LANEMA / {direction_nom}")
+    c.drawRightString(RIGHT, y, f"Abidjan, le {proforma.date_emission.strftime('%d/%m/%Y') if proforma.date_emission else ''}")
+    y -= 6 * mm
+
+    # ── Informations client ─────────────────────────────────────────────
+    c.setFillColor(colors.HexColor("#F3F6FB"))
+    c.rect(LEFT, y - 2 * mm, USABLE_W, 4.5 * mm, fill=1, stroke=0)
+    c.setFillColor(primary)
+    c.setFont("Helvetica-Bold", 8)
+    c.drawString(LEFT + 2 * mm, y, "INFORMATIONS CLIENT")
+    y -= 5 * mm
+
+    info_rows = [
+        ("Domaine(s) d'activité(s)", getattr(client_profile, "domaine_activite", "") or "-"),
+        ("Raison sociale", getattr(client_profile, "raison_sociale", "") or proforma.client.get_full_name() or proforma.client.username),
+        ("Adresse", getattr(client_profile, "adresse", "") or "-"),
+        ("Situation géographique", getattr(client_profile, "situation_geographique", "") or "-"),
+        ("Tél", getattr(client_profile, "telephone", "") or "-"),
+        ("Code client", getattr(client_profile, "code_client", "") or "-"),
+        ("Personne à contacter", getattr(client_profile, "contact_nom", "") or "-"),
+        ("E-mail", proforma.client.email),
+        ("Date de la demande", demande.created_at.strftime("%d/%m/%Y") if demande else ""),
+        ("Nature de l'objet", (demande.objet if demande else "") or "-"),
+    ]
+    c.setFont("Helvetica", 8)
+    for label, value in info_rows:
+        c.setFillColor(muted)
+        c.drawString(LEFT + 2 * mm, y, f"{label} :")
+        c.setFillColor(ink)
+        c.drawString(LEFT + 58 * mm, y, str(value)[:70])
+        y -= 4.2 * mm
+    y -= 2 * mm
+
+    # ── Table 1 : Prestations d'essais/étalonnage/vérification ─────────
+    c.setFont("Helvetica-Bold", 8)
+    c.setFillColor(ink)
+    c.drawString(LEFT, y, "1 - Prestations d'essais / étalonnage / vérification")
+    y -= 5 * mm
+
+    lignes = list(demande.echantillons_prevus.all()) if demande else []
+    data1 = [["Paramètres ou Grandeurs", "Méthodes utilisées", "P.U.", "Nombre", "Montant"]]
+    total1 = 0
+    for e in lignes[:8]:
+        pu = float(e.prix_unitaire) if e.prix_unitaire is not None else 0
+        montant = pu * e.quantite
+        total1 += montant
+        nom = f"{e.nom}{' (ST)' if e.sous_traite else ''}"
+        data1.append([nom, e.methode_utilisee or "-", f"{pu:,.0f}".replace(",", " "), str(e.quantite), f"{montant:,.0f}".replace(",", " ")])
+    if not lignes:
+        data1.append(["-", "-", "-", "-", "-"])
+    data1.append(["", "", "", "SOUS TOTAL 1 (H.T.)", f"{total1:,.0f}".replace(",", " ")])
+
+    table1 = Table(data1, colWidths=[58 * mm, 45 * mm, 22 * mm, 20 * mm, 29 * mm])
+    table1.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), primary),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#C9D7EE")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (2, 0), (-1, -1), "RIGHT"),
+        ("SPAN", (0, -1), (2, -1)),
+    ]))
+    tw, th = table1.wrapOn(c, USABLE_W, 100 * mm)
+    table1.drawOn(c, LEFT, y - th)
+    y -= th + 5 * mm
+
+    # ── Table 2 : Prélèvement ou récupération de l'appareil de mesure ──
+    c.setFont("Helvetica-Bold", 8)
+    c.drawString(LEFT, y, "2 - Prélèvement ou récupération de l'appareil de mesure")
+    y -= 5 * mm
+
+    data2 = [["Désignation", "Durée (h)", "Km", "Nombre", "P.U.", "Montant"]]
+    interventions = {i.designation: i for i in (demande.interventions_prelevement.all() if demande else [])}
+    total2 = 0
+    for code, label in [
+        ("INGENIEUR", "Intervention d'un ingénieur"), ("TECHNICIEN", "Intervention d'un technicien"),
+        ("CHAUFFEUR", "Intervention d'un chauffeur"), ("VEHICULE", "Coût du véhicule d'intervention"),
+        ("DEPLACEMENT", "Coût de déplacement"),
+    ]:
+        ligne = interventions.get(code)
+        if ligne and (ligne.nombre or ligne.prix_unitaire):
+            montant = float(ligne.montant)
+            total2 += montant
+            data2.append([
+                label, f"{ligne.duree_heures}" if ligne.duree_heures else "-", f"{ligne.km}" if ligne.km else "-",
+                str(ligne.nombre), f"{ligne.prix_unitaire:,.0f}".replace(",", " "), f"{montant:,.0f}".replace(",", " "),
+            ])
+        else:
+            data2.append([label, "-", "-", "-", "-", "-"])
+    data2.append(["", "", "", "", "SOUS TOTAL 2 (H.T.)", f"{total2:,.0f}".replace(",", " ")])
+
+    table2 = Table(data2, colWidths=[62 * mm, 20 * mm, 18 * mm, 18 * mm, 24 * mm, 32 * mm])
+    table2.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), primary),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#C9D7EE")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
+        ("SPAN", (0, -1), (3, -1)),
+    ]))
+    tw2, th2 = table2.wrapOn(c, USABLE_W, 60 * mm)
+    table2.drawOn(c, LEFT, y - th2)
+    y -= th2 + 5 * mm
+
+    # ── Accreditations (reference statique) + Totaux ───────────────────
+    acc_w = 110 * mm
+    tot_w = USABLE_W - acc_w - 4 * mm
+    acc_data = [
+        ["Grandeurs", "N° Acc", "Portée Acc"],
+        ["UDT", "ET-19001", "Chaîne : -20°C à 600°C / Enc : -20°C à 150°C"],
+        ["UDP", "ET-19001-1", "Hyd : 0 bar à 1200 bar / Pne : 1 bar à 20 bars"],
+        ["LEE", "ES 20001", "Ph, Ca, Mg, Cl-, Ip, NO2, NO3, C, Cd, Al"],
+    ]
+    acc_table = Table(acc_data, colWidths=[18 * mm, 22 * mm, acc_w - 40 * mm])
+    acc_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E2E8F0")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 6.5),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#C9D7EE")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    tw3, th3 = acc_table.wrapOn(c, acc_w, 30 * mm)
+    acc_table.drawOn(c, LEFT, y - th3)
+
     tva = (float(proforma.montant_ttc) - float(proforma.montant_ht)) if proforma.montant_ttc is not None and proforma.montant_ht is not None else 0
-    c.drawRightString(width - 18 * mm, total_y - 6 * mm, f"TVA: {tva:.2f} {proforma.devise}")
-    c.setFont("Helvetica-Bold", 11)
-    c.drawRightString(width - 18 * mm, total_y - 13 * mm, f"Total: {proforma.montant_ttc} {proforma.devise}")
+    tot_data = [
+        ["TOTAL H.T.", f"{proforma.montant_ht} {proforma.devise}"],
+        ["Remise", "-"],
+        ["Montant H.T.", f"{proforma.montant_ht} {proforma.devise}"],
+        ["T.V.A.", f"{tva:.0f} {proforma.devise}"],
+        ["TOTAL T.T.C.", f"{proforma.montant_ttc} {proforma.devise}"],
+    ]
+    tot_table = Table(tot_data, colWidths=[tot_w * 0.5, tot_w * 0.5])
+    tot_table.setStyle(TableStyle([
+        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#C9D7EE")),
+        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    tw4, th4 = tot_table.wrapOn(c, tot_w, 30 * mm)
+    tot_table.drawOn(c, LEFT + acc_w + 4 * mm, y - th4)
 
-    # Signature responsable labo
-    _draw_responsable_signature(c, 18 * mm, total_y - 30 * mm, proforma)
+    y -= max(th3, th4) + 6 * mm
+
+    # ── Champs bas de formulaire ─────────────────────────────────────────
+    c.setFont("Helvetica", 8)
+    bottom_rows = [
+        ("Délais de réalisation", f"{demande.delai_realisation_jours} jours ouvrés" if demande and demande.delai_realisation_jours else "24h ouvrées"),
+        ("Accord de Sous-traitance", _oui_non(demande.accord_sous_traitance if demande else None)),
+        ("Le laboratoire doit-il gérer le renvoi du matériel", _oui_non(demande.retour_materiel_gere_labo if demande else None)),
+        ("Lieu de réalisation des Travaux", dict(demande.LIEU_REALISATION_CHOICES).get(demande.lieu_realisation, "Laboratoire") if demande else "Laboratoire"),
+        ("Observations particulières", (demande.observations_particulieres if demande else "") or "-"),
+        ("Déclaration de Conformité", _oui_non(demande.declaration_conformite_souhaitee if demande else None)),
+        ("Règle de décision", (demande.regle_decision if demande else "") or "-"),
+    ]
+    for label, value in bottom_rows:
+        c.setFillColor(muted)
+        c.drawString(LEFT, y, f"{label} :")
+        c.setFillColor(ink)
+        c.drawString(LEFT + 75 * mm, y, str(value)[:55])
+        y -= 4.2 * mm
+
+    if demande and demande.accord_sous_traitance:
+        sous_traitants = ", ".join(demande.sous_traitants_choisis.values_list("nom", flat=True))
+        if sous_traitants or demande.sous_traitants_souhaits_libres:
+            c.setFillColor(muted)
+            c.drawString(LEFT, y, "Sous-traitant(s) :")
+            c.setFillColor(ink)
+            texte = sous_traitants or demande.sous_traitants_souhaits_libres
+            c.drawString(LEFT + 75 * mm, y, str(texte)[:55])
+            y -= 4.2 * mm
+
+    y -= 2 * mm
+    c.setFont("Helvetica-Bold", 9)
+    c.setFillColor(ink)
+    c.drawString(LEFT, y, f"Arrêté le présent devis à la somme de : {proforma.montant_ttc} {proforma.devise} (T.T.C.)")
+    y -= 10 * mm
+
+    # ── Signatures ────────────────────────────────────────────────────
+    bon_commande = proforma.bons_commande.filter(statut="SIGNE_CLIENT").order_by("-date_signature_client").first()
+    c.setFont("Helvetica", 8)
+    c.setFillColor(ink)
+    c.drawString(LEFT, y, "Le Client")
+    if bon_commande is not None:
+        _draw_client_signature(c, LEFT, y - 6 * mm, bon_commande)
+    else:
+        c.setFont("Helvetica-Oblique", 7)
+        c.setFillColor(muted)
+        c.drawString(LEFT, y - 10 * mm, "(non signé)")
+
+    _draw_responsable_signature(c, LEFT + 100 * mm, y, proforma)
+    c.setFillColor(colors.black)
 
     # Footer
-    c.setFont("Helvetica-Oblique", 10)
+    c.setFont("Helvetica-Oblique", 8)
     c.setFillColor(colors.HexColor("#2D7EDB"))
-    c.drawCentredString(width / 2, 20 * mm, "Merci pour votre confiance !")
+    c.drawCentredString(width / 2, 12 * mm, "Avant utilisation d'un document, vérifier sa validité — EN 002-PG002")
     c.setFillColor(colors.black)
 
     c.showPage()

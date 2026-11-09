@@ -56,6 +56,11 @@ class DemandeDevis(models.Model):
         ("REFUSEE", "Refusée"),
     ]
 
+    LIEU_REALISATION_CHOICES = [
+        ("LABORATOIRE", "Laboratoire"),
+        ("SITE_CLIENT", "Site client"),
+    ]
+
     numero = models.CharField(max_length=50, unique=True)
     client = models.ForeignKey(
         User,
@@ -82,11 +87,61 @@ class DemandeDevis(models.Model):
         blank=True, help_text="Sous-traitants hors catalogue, souhaites librement par le client"
     )
 
+    # Champs restants du formulaire officiel EN 002-PG002, non repris ailleurs :
+    # "Le laboratoire doit-il gerer le renvoi du materiel", "Lieu de realisation
+    # des Travaux", "Observations particulieres", "Declaration de Conformite"
+    # + "Regle de decision" (cette derniere renseignee par le service reception
+    # lors de la finalisation du devis officiel).
+    retour_materiel_gere_labo = models.BooleanField(
+        null=True, blank=True, help_text="Le laboratoire doit-il gerer le renvoi du materiel (metrologie)"
+    )
+    lieu_realisation = models.CharField(
+        max_length=20, choices=LIEU_REALISATION_CHOICES, default="LABORATOIRE"
+    )
+    observations_particulieres = models.TextField(blank=True)
+    declaration_conformite_souhaitee = models.BooleanField(null=True, blank=True)
+    regle_decision = models.CharField(max_length=255, blank=True)
+
     class Meta:
         ordering = ["-created_at"]
 
     def __str__(self) -> str:  # pragma: no cover
         return self.numero
+
+
+class InterventionPrelevement(models.Model):
+    """Ligne du tableau "2 - Prélèvement ou récupération de l'appareil de
+    mesure" du formulaire officiel EN 002-PG002 — designations fixes,
+    renseignees par le service reception lors de la finalisation du devis
+    (duree, kilometrage, nombre et prix unitaire), avant envoi au client."""
+
+    DESIGNATION_CHOICES = [
+        ("INGENIEUR", "Intervention d'un ingénieur"),
+        ("TECHNICIEN", "Intervention d'un technicien"),
+        ("CHAUFFEUR", "Intervention d'un chauffeur"),
+        ("VEHICULE", "Coût du véhicule d'intervention"),
+        ("DEPLACEMENT", "Coût de déplacement"),
+    ]
+
+    demande = models.ForeignKey(
+        DemandeDevis, on_delete=models.CASCADE, related_name="interventions_prelevement"
+    )
+    designation = models.CharField(max_length=20, choices=DESIGNATION_CHOICES)
+    duree_heures = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    km = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    nombre = models.PositiveIntegerField(default=0)
+    prix_unitaire = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+
+    class Meta:
+        unique_together = ("demande", "designation")
+        ordering = ["id"]
+
+    @property
+    def montant(self):
+        return (self.prix_unitaire or 0) * (self.nombre or 0)
+
+    def __str__(self) -> str:  # pragma: no cover
+        return f"{self.get_designation_display()} ({self.demande.numero})"
 
 
 class EchantillonPrevu(models.Model):
@@ -98,6 +153,13 @@ class EchantillonPrevu(models.Model):
     demande = models.ForeignKey(DemandeDevis, on_delete=models.CASCADE, related_name="echantillons_prevus")
     nom = models.CharField(max_length=255)
     quantite = models.PositiveIntegerField(default=1)
+
+    # Renseignes par le service reception lors de la finalisation du devis
+    # officiel : correspond a la ligne "Paramètres ou Grandeurs / Méthodes
+    # utilisées / P.U. / Nombre / Montant" du formulaire EN 002-PG002.
+    methode_utilisee = models.CharField(max_length=255, blank=True)
+    prix_unitaire = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    sous_traite = models.BooleanField(default=False, help_text="Prestation sous-traitee (mention 'ST' sur le devis)")
 
     def __str__(self) -> str:  # pragma: no cover
         return f"{self.nom} x{self.quantite} ({self.demande.numero})"
