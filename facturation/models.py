@@ -227,13 +227,15 @@ class Facture(ValidationResponsableMixin):
     STATUT_CHOICES = [
         ("EN_ATTENTE", "En attente"),
         ("EN_ATTENTE_VALIDATION", "En attente de validation comptable"),
+        ("ENGAGEE", "Engagée — bon de commande client validé"),
         ("PAYEE", "Payée"),
         ("ANNULEE", "Annulée"),
     ]
 
     MODE_PAIEMENT_CHOICES = [
         ("CHEQUE", "Chèque"),
-        ("COMPTANT", "Comptant"),
+        ("COMPTANT", "Espèces"),
+        ("BON_COMMANDE", "Bon de commande du client"),
     ]
 
     numero = models.CharField(max_length=50, unique=True)
@@ -281,6 +283,14 @@ class Facture(ValidationResponsableMixin):
         help_text="Quand vrai, la facture apparaît dans l'espace client",
     )
     reference_paiement = models.CharField(max_length=100, blank=True)
+
+    # Autorisation de demarrage des travaux, donnee par le service facturation
+    # des que le reglement (cheque, bon de commande client, especes) est valide.
+    travaux_autorises = models.BooleanField(default=False)
+    travaux_autorises_le = models.DateTimeField(null=True, blank=True)
+    travaux_autorises_par = models.ForeignKey(
+        "auth.User", on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
 
     class Meta:
         ordering = ["-date_emission", "-id"]

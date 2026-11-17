@@ -18,6 +18,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from . import devis_utils, email_service
+from .travaux import MESSAGE_BLOQUE, TYPES_METROLOGIE as _TM, autoriser_travaux, peut_demarrer
 from .models import BonCommande, CompteEmailLabo, EmailDevis, Facture, Proforma, DemandeAnalyse
 from .serializers import (
     BonCommandeSerializer, CompteEmailLaboSerializer, EmailDevisSerializer,
@@ -227,6 +228,57 @@ def _tva_rate():
     return TVA_RATE
 
 
+
+def _nom_client(proforma):
+    profil = getattr(proforma.client, "client_profile", None)
+    return getattr(profil, "raison_sociale", "") or proforma.client.get_full_name() or proforma.client.username
+
+
+def _notifier_reception(titre, message):
+    try:
+        from notifications.models import notifier_utilisateurs_par_role
+
+        notifier_utilisateurs_par_role("RECEPTION", titre, message, lien="/app/reception")
+    except Exception:  # pragma: no cover - ne bloque jamais l'action du client
+        pass
+
+
+TYPES_METROLOGIE = _TM
+
+
+def _etape_suivante(proforma):
+    """Etape du dossier apres approbation du devis et geste attendu du service reception."""
+    from metrologie.models import FicheTravauxMetrologie
+    from qualite.models import Echantillon, FicheEntreeEquipement
+
+    d = proforma.demande_devis
+    if not peut_demarrer(d):
+        facture = Facture.objects.filter(proforma=proforma).first()
+        dossier = "METROLOGIE" if d is not None and d.type_analyse in TYPES_METROLOGIE else "ANALYSES"
+        return dossier, "ATTENTE_REGLEMENT", f"En attente de règlement {('— facture ' + facture.numero) if facture else ''} (chèque, bon de commande ou espèces)".replace("  ", " "), None
+    if d is not None and d.type_analyse in TYPES_METROLOGIE:
+        fes = list(FicheEntreeEquipement.objects.filter(demande_devis=d, domaine="METROLOGIE"))
+        fiches = list(FicheTravauxMetrologie.objects.filter(demande_devis=d))
+        if fiches and all(f.statut == "CLOTUREE" for f in fiches):
+            return "METROLOGIE", "TERMINE", "Certificats transmis au client", None
+        if not fes:
+            return "METROLOGIE", "A_RECEPTIONNER", "Équipement à réceptionner", "equipement"
+        if not fiches or any(not fe.equipements_ftm.exists() for fe in fes):
+            return "METROLOGIE", "FET_A_ETABLIR", "Fiche d'exécution de métrologie à établir", "fet"
+        return "METROLOGIE", "A_LA_DMCT", "À la DMCT — suivi dans l'onglet FET", "fet"
+    da = DemandeAnalyse.objects.filter(proforma=proforma).first()
+    if da is None:
+        return "ANALYSES", "BON_COMMANDE", "Bon de commande à signer", "devis"
+    if da.statut == "RESULTATS_ENVOYES":
+        return "ANALYSES", "TERMINE", "Rapports remis au client", None
+    echs = Echantillon.objects.filter(demande=da)
+    if not echs.exists():
+        return "ANALYSES", "A_RECEPTIONNER", "Échantillons à réceptionner", "echantillons"
+    if echs.filter(fiche__isnull=True).exists():
+        return "ANALYSES", "FET_A_ETABLIR", "Fiche d'exécution à établir", "fet"
+    return "ANALYSES", "AU_LABO", "Au laboratoire — suivi dans l'onglet FET", "fet"
+
+
 def _fmt_montant(valeur):
     try:
         return f"{float(valeur):,.0f}".replace(",", " ")
@@ -287,9 +339,8 @@ def _signer_bon_commande(bon_commande, signature_file):
     bon_commande.date_signature_client = timezone.now().date()
     bon_commande.statut = "SIGNE_CLIENT"
     bon_commande.save(update_fields=["signature_client_image", "date_signature_client", "statut"])
-    facture = Facture.objects.filter(bon_commande=bon_commande).first()
-    if facture is not None:
-        _creer_demande_analyse_si_absente(facture)
+    # Les travaux ne demarrent plus a la signature : c'est la validation du
+    # reglement par le service facturation qui les autorise (cf. travaux.py).
 
 
 def _lien_pdf_public(request, proforma):
@@ -423,6 +474,23 @@ class ProformaViewSet(viewsets.ModelViewSet):
         super().perform_destroy(instance)
 
     # ── Fiche de devis (formulaire EN 002-PG002) ────────────────────────────
+    @action(detail=False, methods=["get"], url_path="approuves")
+    def approuves(self, request):
+        """Devis approuves par le client, avec l'etape suivante a traiter par le service reception."""
+        _exiger_reception(request)
+        res = []
+        qs = Proforma.objects.filter(statut="ACCEPTEE").select_related("client", "demande_devis").order_by("-lu_approuve_le", "-id")[:200]
+        for p in qs:
+            type_dossier, etape, libelle, geste = _etape_suivante(p)
+            res.append({
+                "id": p.id, "numero": p.numero, "demande_devis": p.demande_devis_id,
+                "devis_numero": p.demande_devis.numero if p.demande_devis else "", "client_nom": _nom_client(p),
+                "objet": p.demande_devis.objet if p.demande_devis else "", "type": type_dossier,
+                "montant_ttc": p.montant_ttc, "devise": p.devise, "lu_approuve_le": p.lu_approuve_le,
+                "etape": etape, "etape_label": libelle, "geste": geste,
+            })
+        return Response(res)
+
     @action(detail=True, methods=["get"], url_path="fiche")
     def fiche(self, request, pk=None):
         """Fiche de devis complete : consultation par le client (espace client)
@@ -730,6 +798,11 @@ class ProformaViewSet(viewsets.ModelViewSet):
             bon_commande = _accepter_proforma(proforma)
             _signer_bon_commande(bon_commande, ContentFile(contenu, name=f"signature_{bon_commande.numero}.png"))
 
+        _notifier_reception(
+            f"Devis {proforma.numero} approuvé par le client",
+            f"{_nom_client(proforma)} a apposé la mention « Lu et approuvé ». La facture est émise : les travaux démarreront dès que le service "
+            "facturation aura validé le règlement (chèque, bon de commande ou espèces).",
+        )
         proforma.refresh_from_db()
         return Response(_fiche_devis(proforma, request))
 
@@ -906,6 +979,7 @@ class ProformaViewSet(viewsets.ModelViewSet):
         proforma = self.get_object()
         proforma.statut = "REFUSEE"
         proforma.save(update_fields=["statut"])
+        _notifier_reception(f"Devis {proforma.numero} refusé par le client", f"{_nom_client(proforma)} a refusé le devis.")
 
         # Synchroniser le statut du devis associé
         if proforma.demande_devis is not None:
@@ -1137,16 +1211,16 @@ class FactureViewSet(viewsets.ModelViewSet):
                 {"detail": "Vous devez d'abord signer votre bon de commande avant de procéder au paiement."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if not facture.bon_commande.signature_responsable_appliquee:
-            return Response(
-                {"detail": "Le bon de commande doit d'abord être validé par le responsable du laboratoire."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
 
         mode_paiement = request.data.get("mode_paiement")
         if mode_paiement not in dict(Facture.MODE_PAIEMENT_CHOICES):
             return Response(
                 {"detail": "mode_paiement invalide"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if mode_paiement == "BON_COMMANDE" and not (request.data.get("reference_paiement") or "").strip():
+            return Response(
+                {"detail": "Indiquez le numéro de votre bon de commande."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -1337,24 +1411,21 @@ class FactureViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        facture.paiement_valide = True
         facture.visible_client = True
-        facture.statut = "PAYEE"
-        facture.date_paiement = facture.date_paiement or timezone.now().date()
-        facture.save(
-            update_fields=[
-                "paiement_valide",
-                "visible_client",
-                "statut",
-                "date_paiement",
-            ]
-        )
+        if facture.mode_paiement == "BON_COMMANDE":
+            # Bon de commande du client : engagement ferme de paiement. La facture
+            # reste a regler (elle sera encaissee plus tard) mais les travaux demarrent.
+            facture.statut = "ENGAGEE"
+            facture.save(update_fields=["visible_client", "statut"])
+        else:
+            facture.paiement_valide = True
+            facture.statut = "PAYEE"
+            facture.date_paiement = facture.date_paiement or timezone.now().date()
+            facture.save(update_fields=["paiement_valide", "visible_client", "statut", "date_paiement"])
 
-        # Le paiement etant valide, la demande d'analyse peut demarrer : le
-        # labo va pouvoir receptionner les echantillons. Cree ici plutot qu'a
-        # l'acceptation du devis, puisque le client doit desormais payer AVANT
-        # que l'analyse ne soit engagee.
-        _creer_demande_analyse_si_absente(facture)
+        # Le reglement etant valide, les travaux sont autorises : la reception,
+        # le laboratoire (analyses) ou la DMCT (metrologie) en sont informes.
+        autoriser_travaux(facture, user)
 
         serializer = self.get_serializer(facture, context={"request": request})
         return Response(serializer.data)
@@ -1377,7 +1448,7 @@ class FactureViewSet(viewsets.ModelViewSet):
         if not user_has_permission(user, "facturation.encaisser"):
             return Response({"detail": "Non autorisé"}, status=status.HTTP_403_FORBIDDEN)
 
-        if facture.statut not in ("EN_ATTENTE", "RETARD", "EN_ATTENTE_VALIDATION"):
+        if facture.statut not in ("EN_ATTENTE", "RETARD", "EN_ATTENTE_VALIDATION", "ENGAGEE"):
             return Response(
                 {"detail": "Cette facture ne peut pas être encaissée dans son état actuel."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -1391,17 +1462,16 @@ class FactureViewSet(viewsets.ModelViewSet):
                 {"detail": "Le client doit d'abord signer son bon de commande avant tout encaissement."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if not facture.bon_commande.signature_responsable_appliquee:
-            return Response(
-                {"detail": "Le bon de commande doit d'abord être validé par le responsable du laboratoire."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
 
         mode_paiement = request.data.get("mode_paiement")
         if mode_paiement not in dict(Facture.MODE_PAIEMENT_CHOICES):
             return Response({"detail": "mode_paiement invalide"}, status=status.HTTP_400_BAD_REQUEST)
 
         reference = (request.data.get("reference_paiement") or "").strip()
+        if mode_paiement == "BON_COMMANDE" and not reference:
+            return Response({"detail": "Indiquez le numéro du bon de commande du client."}, status=status.HTTP_400_BAD_REQUEST)
+        if mode_paiement == "BON_COMMANDE" and facture.statut == "ENGAGEE":
+            return Response({"detail": "Le bon de commande de ce client est déjà enregistré."}, status=status.HTTP_400_BAD_REQUEST)
 
         from django.core.files.base import ContentFile
 
@@ -1413,23 +1483,17 @@ class FactureViewSet(viewsets.ModelViewSet):
         facture.justificatif_paiement.save(
             f"recu_{facture.numero}.pdf", ContentFile(recu_pdf), save=False
         )
-        facture.paiement_valide = True
         facture.visible_client = True
-        facture.statut = "PAYEE"
-        facture.date_paiement = timezone.now().date()
-        facture.save(
-            update_fields=[
-                "mode_paiement",
-                "reference_paiement",
-                "justificatif_paiement",
-                "paiement_valide",
-                "visible_client",
-                "statut",
-                "date_paiement",
-            ]
-        )
+        if mode_paiement == "BON_COMMANDE":
+            facture.statut = "ENGAGEE"  # engagement ferme du client : travaux autorises, facture a regler plus tard
+            facture.save(update_fields=["mode_paiement", "reference_paiement", "justificatif_paiement", "visible_client", "statut"])
+        else:
+            facture.paiement_valide = True
+            facture.statut = "PAYEE"
+            facture.date_paiement = timezone.now().date()
+            facture.save(update_fields=["mode_paiement", "reference_paiement", "justificatif_paiement", "paiement_valide", "visible_client", "statut", "date_paiement"])
 
-        _creer_demande_analyse_si_absente(facture)
+        autoriser_travaux(facture, user)
 
         serializer = self.get_serializer(facture, context={"request": request})
         return Response(serializer.data)
@@ -1482,13 +1546,8 @@ class DemandeAnalyseViewSet(viewsets.ModelViewSet):
         if not user_has_permission(request.user, "echantillons.manage"):
             return Response({"detail": "Non autorisé"}, status=status.HTTP_403_FORBIDDEN)
         facture = analyse.facture
-        bon_commande_signe = bool(facture and facture.bon_commande_id and facture.bon_commande.statut == "SIGNE_CLIENT")
-        paiement_valide = bool(facture and facture.statut == "PAYEE")
-        if not (bon_commande_signe or paiement_valide):
-            return Response(
-                {"detail": "Le devis doit être signé par le client (bon pour accord) avant la réception des échantillons."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        if not (facture and facture.travaux_autorises):
+            return Response({"detail": MESSAGE_BLOQUE}, status=status.HTTP_400_BAD_REQUEST)
         if analyse.statut != "EN_ATTENTE_ECHANTILLONS":
             return Response(
                 {"detail": "Cette demande n'est pas en attente de dépôt d'échantillons."},

@@ -183,6 +183,10 @@ def creer_ftm(demande_devis, data, user):
 
 @transaction.atomic
 def transmettre_ftm(fiche, user):
+    from facturation.travaux import MESSAGE_BLOQUE, peut_demarrer
+
+    if not peut_demarrer(fiche.demande_devis):
+        raise ValueError(MESSAGE_BLOQUE)
     eqs = list(fiche.equipements.select_related("fiche_entree"))
     if not eqs:
         raise ValueError("Ajoutez au moins un équipement à la fiche avant de la transmettre.")

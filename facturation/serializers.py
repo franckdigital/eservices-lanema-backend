@@ -147,6 +147,8 @@ class FactureSerializer(serializers.ModelSerializer):
             "paiement_valide",
             "visible_client",
             "reference_paiement",
+            "travaux_autorises",
+            "travaux_autorises_le",
             "valide_par_responsable",
             "valide_par_responsable_nom",
             "date_validation_responsable",

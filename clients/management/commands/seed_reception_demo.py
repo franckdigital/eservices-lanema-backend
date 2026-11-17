@@ -18,6 +18,8 @@ from clients.permissions_catalog import DEFAULT_ROLE_PERMISSIONS
 from demandes.models import CreneauDisponibilite, DemandeDevis, SousTraitantPartenaire
 from demandes.views import creer_devis_et_proforma
 
+COMPTABLE_EMAIL = "facturation@demo.com"
+COMPTABLE_PASSWORD = "Facture@2026"
 RECEPTION_EMAIL = "reception@demo.com"
 RECEPTION_PASSWORD = "Reception@2026"
 CLIENT_EMAIL = "client.devis@demo.com"
@@ -39,6 +41,39 @@ class Command(BaseCommand):
         user.save()
         ClientProfile.objects.update_or_create(user=user, defaults={"role": role, **profil})
         return user
+
+    def _impaye_demo(self, client):
+        """Devis approuve et facture emise, mais reglement non encore valide : les travaux sont bloques."""
+        import io
+
+        from django.core.files.base import ContentFile
+        from PIL import Image
+
+        from facturation.views import _accepter_proforma, _signer_bon_commande
+
+        buf = io.BytesIO()
+        Image.new("RGB", (160, 60), "white").save(buf, "PNG")
+        _, proforma = creer_devis_et_proforma(
+            client=client, type_analyse="EAUX_CONSOMMATION", categorie="Eau de boisson", objet="Eaux de puits — suivi trimestriel (règlement en attente)",
+            description="Dossier de démonstration : en attente de règlement", priorite="NORMALE", echantillons=[{"nom": "Eau de puits P1", "quantite": 2}],
+        )
+        proforma.statut, proforma.lu_approuve, proforma.lu_approuve_le, proforma.lu_approuve_par = "ENVOYEE", True, timezone.now(), client
+        proforma.save()
+        _signer_bon_commande(_accepter_proforma(proforma), ContentFile(buf.getvalue(), name="signature.png"))
+
+    def _regler(self, proforma, mode="CHEQUE", reference="CHQ-0001"):
+        """Le service facturation valide le reglement : les travaux sont autorises."""
+        from facturation.models import Facture
+        from facturation.travaux import autoriser_travaux
+
+        facture = Facture.objects.get(proforma=proforma)
+        facture.mode_paiement, facture.reference_paiement, facture.visible_client = mode, reference, True
+        if mode == "BON_COMMANDE":
+            facture.statut = "ENGAGEE"
+        else:
+            facture.statut, facture.paiement_valide, facture.date_paiement = "PAYEE", True, timezone.now().date()
+        facture.save()
+        autoriser_travaux(facture, self.comptable)
 
     def handle(self, *args, **options):
         # Permissions du role RECEPTION (deja semees par migration ; garde-fou)
@@ -65,6 +100,13 @@ class Command(BaseCommand):
         technicien = self._compte(
             TECH_EMAIL, TECH_PASSWORD, "Aïcha", "Koné", "TECHNICIEN", organisation="LANEMA — Direction des Essais et Analyses",
         )
+
+        comptable = self._compte(
+            COMPTABLE_EMAIL, COMPTABLE_PASSWORD, "Marie", "Service Facturation", "COMPTABLE", organisation="LANEMA — Service facturation et caisse",
+        )
+        for code in DEFAULT_ROLE_PERMISSIONS["COMPTABLE"]:
+            LaboRolePermission.objects.get_or_create(role="COMPTABLE", permission_code=code, defaults={"is_granted": True})
+        self.comptable = comptable
 
         # Compte DMCT (e-diligence) pour l'espace « Fiches d'exécution & certificats »
         from django.core.management import call_command
@@ -120,9 +162,11 @@ class Command(BaseCommand):
             self.stdout.write(self.style.SUCCESS("3 devis de démonstration créés."))
             self._circuit_demo(client, reception, technicien)
             self._metrologie_demo(client, reception)
+            self._impaye_demo(client)
 
         self.stdout.write(self.style.MIGRATE_HEADING("\nAccès de démonstration :"))
         self.stdout.write(f"  Responsable service réception : {RECEPTION_EMAIL} / {RECEPTION_PASSWORD}")
+        self.stdout.write(f"  Service facturation / caisse : {COMPTABLE_EMAIL} / {COMPTABLE_PASSWORD}")
         self.stdout.write(f"  Client (pour la fiche + « Lu et approuvé ») : {CLIENT_EMAIL} / {CLIENT_PASSWORD}")
 
     # ── Circuit réception <-> laboratoire : 3 dossiers à des stades différents ──
@@ -144,6 +188,8 @@ class Command(BaseCommand):
         labos = {l.code: l for l in Laboratoire.objects.filter(code__in=["LMP", "LAI", "LEE", "LPI"])}
         today = timezone.now().date()
 
+        modes = iter([("CHEQUE", "CHQ-4471"), ("BON_COMMANDE", "BC-2026-118"), ("COMPTANT", "RECU-CAISSE-09")] * 3)
+
         def dossier(objet, type_analyse, categorie, echs):
             _, proforma = creer_devis_et_proforma(
                 client=client, type_analyse=type_analyse, categorie=categorie, objet=objet, description="Dossier de démonstration du circuit réception / laboratoire",
@@ -153,6 +199,7 @@ class Command(BaseCommand):
             proforma.save()
             bon = _accepter_proforma(proforma)
             _signer_bon_commande(bon, ContentFile(png, name="signature.png"))
+            self._regler(proforma, *next(modes))
             from facturation.models import DemandeAnalyse
             da = DemandeAnalyse.objects.get(proforma=proforma)
             samples = [
@@ -223,6 +270,8 @@ class Command(BaseCommand):
         dmct_user = User.objects.get(username="dmct.demo")
         today = timezone.now().date()
 
+        modes = iter([("CHEQUE", "CHQ-5120"), ("BON_COMMANDE", "BC-2026-131"), ("COMPTANT", "RECU-CAISSE-12")] * 3)
+
         def dossier(objet, instruments, equipements, lieu="LABORATOIRE"):
             _, proforma = creer_devis_et_proforma(
                 client=client, type_analyse="METROLOGIE", categorie="Balances et masses", objet=objet, description="Dossier de démonstration — circuit métrologie",
@@ -231,6 +280,7 @@ class Command(BaseCommand):
             proforma.statut, proforma.lu_approuve, proforma.lu_approuve_le, proforma.lu_approuve_par = "ENVOYEE", True, timezone.now(), client
             proforma.save()
             _signer_bon_commande(_accepter_proforma(proforma), ContentFile(png, name="signature.png"))
+            self._regler(proforma, *next(modes))
             devis = proforma.demande_devis
             fes = [
                 FicheEntreeEquipement.objects.create(domaine="METROLOGIE", demande_devis=devis, designation=d, marque=m, modele=mo, numero_serie=sn,

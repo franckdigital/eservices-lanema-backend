@@ -42,13 +42,11 @@ class EchantillonViewSet(viewsets.ModelViewSet):
         self._check_labo_staff()
         demande = serializer.validated_data.get("demande")
         if demande is not None:
+            from facturation.travaux import MESSAGE_BLOQUE
+
             facture = demande.facture
-            bon_commande_signe = bool(facture and facture.bon_commande_id and facture.bon_commande.statut == "SIGNE_CLIENT")
-            paiement_valide = bool(facture and facture.statut == "PAYEE")
-            if not (bon_commande_signe or paiement_valide):
-                raise ValidationError(
-                    {"detail": "Le devis doit être signé par le client (bon pour accord) avant la réception des échantillons."}
-                )
+            if not (facture and facture.travaux_autorises):
+                raise ValidationError({"detail": MESSAGE_BLOQUE})
         serializer.save()
 
         # Enregistrer un echantillon vaut confirmation de sa reception : on
@@ -90,6 +88,12 @@ class FicheEntreeEquipementViewSet(viewsets.ModelViewSet):
         return queryset
 
     def perform_create(self, serializer):
+        devis = serializer.validated_data.get("demande_devis")
+        if devis is not None:
+            from facturation.travaux import MESSAGE_BLOQUE, peut_demarrer
+
+            if not peut_demarrer(devis):
+                raise ValidationError({"detail": MESSAGE_BLOQUE})
         serializer.save(recu_par=self.request.user)
 
 
