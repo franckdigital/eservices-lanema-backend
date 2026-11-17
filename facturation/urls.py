@@ -3,6 +3,7 @@ from rest_framework.routers import DefaultRouter
 
 from .views import (
     BonCommandeViewSet,
+    CompteEmailLaboViewSet,
     DemandeAnalyseViewSet,
     FacturationStatsView,
     FactureViewSet,
@@ -16,6 +17,7 @@ router.register(r"factures", FactureViewSet, basename="facture")
 router.register(r"proformas", ProformaViewSet, basename="proforma")
 router.register(r"bons-commande", BonCommandeViewSet, basename="bon-commande")
 router.register(r"demandes-analyses", DemandeAnalyseViewSet, basename="demande-analyse")
+router.register(r"comptes-email", CompteEmailLaboViewSet, basename="compte-email-labo")
 
 
 urlpatterns = [

@@ -159,6 +159,15 @@ def delai_actuel():
     return creneau
 
 
+
+def _details_instrument(e):
+    """Caracteristiques d'un instrument de metrologie declarees par le client (dict de chaines)."""
+    details = e.get("details") if isinstance(e, dict) else None
+    if not isinstance(details, dict):
+        return {}
+    return {str(k)[:40]: str(v)[:255] for k, v in details.items() if v not in (None, "")}
+
+
 def creer_devis_et_proforma(
     client, type_analyse, categorie, objet, description, priorite, echantillons,
     accord_sous_traitance=False, sous_traitants_ids=None, sous_traitants_libres="",
@@ -194,7 +203,7 @@ def creer_devis_et_proforma(
     EchantillonPrevu.objects.bulk_create([
         EchantillonPrevu(
             demande=demande, nom=(e.get("nom") or "").strip() or "Échantillon", quantite=e.get("quantite") or 1,
-            prix_unitaire=pu,
+            prix_unitaire=pu, details=_details_instrument(e),
         )
         for e in (echantillons or [])
     ])
@@ -422,6 +431,18 @@ class PublicDevisCreateView(APIView):
         }, status=status.HTTP_201_CREATED)
 
 
+class CatalogueMetrologieView(APIView):
+    """Catalogue des familles d'instruments et prestations de metrologie (formulaire public de devis)."""
+
+    permission_classes = [permissions.AllowAny]
+    authentication_classes: list = []
+
+    def get(self, request):
+        from .catalogue_metrologie import catalogue
+
+        return Response(catalogue())
+
+
 class DelaiActuelView(APIView):
     """Delai de realisation actuellement annonce (cf. CreneauDisponibilite) —
     consulte publiquement par le formulaire de demande de devis."""
@@ -526,7 +547,7 @@ class DemandeDevisViewSet(viewsets.ModelViewSet):
         priorite = serializer.initial_data.get("priorite", "NORMALE")
         echantillons = serializer.initial_data.get("echantillons", [])
         EchantillonPrevu.objects.bulk_create([
-            EchantillonPrevu(demande=demande, nom=(e.get("nom") or "").strip() or "Échantillon", quantite=e.get("quantite") or 1)
+            EchantillonPrevu(demande=demande, nom=(e.get("nom") or "").strip() or "Échantillon", quantite=e.get("quantite") or 1, details=_details_instrument(e))
             for e in (echantillons or [])
         ])
 

@@ -33,10 +33,15 @@ class EchantillonSerializer(serializers.ModelSerializer):
             "date_reception",
             "emplacement_stockage",
             "description",
+            "fiche",
+            "date_prelevement",
+            "lieu_prelevement",
+            "prelevement_par",
+            "numero_lot",
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "code_echantillon", "created_at", "updated_at"]
+        read_only_fields = ["id", "code_echantillon", "fiche", "created_at", "updated_at"]
 
 
 class FicheEntreeEquipementSerializer(serializers.ModelSerializer):

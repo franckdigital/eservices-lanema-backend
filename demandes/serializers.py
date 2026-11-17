@@ -12,7 +12,7 @@ from .models import (
 class EchantillonPrevuSerializer(serializers.ModelSerializer):
     class Meta:
         model = EchantillonPrevu
-        fields = ["id", "nom", "quantite", "methode_utilisee", "prix_unitaire", "sous_traite"]
+        fields = ["id", "nom", "quantite", "methode_utilisee", "prix_unitaire", "sous_traite", "accredite", "details"]
         read_only_fields = ["id"]
 
 

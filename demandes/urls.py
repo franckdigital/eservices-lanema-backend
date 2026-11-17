@@ -2,6 +2,7 @@ from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
 from .views import (
+    CatalogueMetrologieView,
     CreneauDisponibiliteViewSet,
     DelaiActuelView,
     DemandeDevisViewSet,
@@ -22,6 +23,7 @@ router.register(r"sous-traitants", SousTraitantPartenaireViewSet, basename="sous
 urlpatterns = [
     path("devis/public/", PublicDevisCreateView.as_view(), name="demande-devis-public"),
     path("delai-actuel/", DelaiActuelView.as_view(), name="demande-devis-delai-actuel"),
+    path("catalogue-metrologie/", CatalogueMetrologieView.as_view(), name="catalogue-metrologie"),
     path("", include(router.urls)),
     path("dashboard/stats/", DemandesDashboardStatsView.as_view(), name="demandes-dashboard-stats"),
     path("types-analyse/", TypesAnalyseView.as_view(), name="types-analyse"),

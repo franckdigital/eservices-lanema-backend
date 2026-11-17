@@ -16,6 +16,10 @@ class Laboratoire(models.Model):
     capacite_journaliere = models.PositiveIntegerField(
         default=0, help_text="Nombre d'essais/jour theorique, pour le calcul de la capacite d'utilisation"
     )
+    # Rattachement hierarchique, repris dans la reference des rapports d'essai
+    # (000/AN/Direction/Sous-Direction//Labo) et le N° de fiche d'execution des travaux.
+    direction = models.CharField(max_length=20, blank=True, help_text="Code de la direction (ex. DEA)")
+    sous_direction = models.CharField(max_length=20, blank=True, help_text="Code de la sous-direction (ex. SDCPA)")
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

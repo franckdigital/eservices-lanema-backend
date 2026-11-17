@@ -1,6 +1,7 @@
 from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
+from .views_circuit import FicheTravauxViewSet, RapportEssaiViewSet
 from .views import (
     ActionQualiteViewSet,
     AuditViewSet,
@@ -25,6 +26,8 @@ router.register(r"fiches-entree-equipement", FicheEntreeEquipementViewSet, basen
 router.register(r"essais", EssaiViewSet, basename="essai")
 router.register(r"actions-qualite", ActionQualiteViewSet, basename="action-qualite-labo")
 router.register(r"recommandations-audit", RecommandationAuditViewSet, basename="recommandation-audit")
+router.register(r"fiches-travaux", FicheTravauxViewSet, basename="fiche-travaux")
+router.register(r"rapports-essai", RapportEssaiViewSet, basename="rapport-essai-officiel")
 
 
 urlpatterns = [

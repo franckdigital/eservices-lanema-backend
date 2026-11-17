@@ -38,3 +38,4 @@ face_recognition_models>=0.3.0
 # Pour les tests
 pytest
 pytest-django
+pypdf>=4.0.0

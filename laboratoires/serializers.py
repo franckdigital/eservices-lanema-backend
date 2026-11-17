@@ -8,5 +8,5 @@ class LaboratoireSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Laboratoire
-        fields = ["id", "nom", "code", "responsable", "responsable_nom", "capacite_journaliere", "created_at"]
+        fields = ["id", "nom", "code", "responsable", "responsable_nom", "capacite_journaliere", "direction", "sous_direction", "created_at"]
         read_only_fields = ["id", "created_at"]

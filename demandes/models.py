@@ -160,6 +160,10 @@ class EchantillonPrevu(models.Model):
     methode_utilisee = models.CharField(max_length=255, blank=True)
     prix_unitaire = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     sous_traite = models.BooleanField(default=False, help_text="Prestation sous-traitee (mention 'ST' sur le devis)")
+    accredite = models.BooleanField(default=False, help_text="Prestation accreditee (marquee (*) sur le devis)")
+    # Metrologie : caracteristiques de l'instrument decrit par le client (famille, marque, modele,
+    # n° de serie, plage de mesure, resolution, classe, unite, localisation, prestation souhaitee...)
+    details = models.JSONField(default=dict, blank=True)
 
     def __str__(self) -> str:  # pragma: no cover
         return f"{self.nom} x{self.quantite} ({self.demande.numero})"

@@ -49,6 +49,23 @@ class Echantillon(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    # Informations de la fiche d'execution des travaux d'essais (EN 003-PG 002)
+    # et du rapport d'essai (EN 001-PG019) : le meme code suit l'echantillon de
+    # la reception jusqu'au rapport.
+    fiche = models.ForeignKey(
+        "qualite.FicheExecutionTravaux", on_delete=models.SET_NULL, null=True, blank=True, related_name="echantillons"
+    )
+    date_prelevement = models.DateField(null=True, blank=True)
+    date_heure_prelevement = models.DateTimeField(null=True, blank=True)
+    lieu_prelevement = models.CharField(max_length=255, blank=True)
+    prelevement_par = models.CharField(max_length=255, blank=True)
+    numero_lot = models.CharField(max_length=100, blank=True)
+    date_heure_arrivee = models.DateTimeField(null=True, blank=True)
+    etat = models.JSONField(default=list, blank=True, help_text="SOLIDE, LIQUIDE, POUDRE, PATE, CRISTAUX, AUTRES")
+    etat_precision = models.CharField(max_length=255, blank=True)
+    parametres = models.TextField(blank=True, help_text="Parametres a analyser")
+    laboratoires = models.ManyToManyField("laboratoires.Laboratoire", blank=True, related_name="echantillons_concernes")
+
     class Meta:
         ordering = ['-created_at']
 
@@ -308,3 +325,154 @@ class RecommandationAudit(models.Model):
 
     def __str__(self) -> str:  # pragma: no cover
         return f"Recommandation {self.audit.reference}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Circuit service reception <-> laboratoire
+#   Fiche d'execution des travaux d'essais (EN 003-PG 002, redigee par la
+#   reception) -> resultats saisis par le laboratoire -> rapport d'essai
+#   (EN 001-PG019, edite par la reception, numero d'ordre chronologique).
+# ═══════════════════════════════════════════════════════════════════════════
+
+class CompteurSequence(models.Model):
+    """Compteur sequentiel (verrouille a l'increment) : numeros de fiches par
+    annee/direction et numeros d'ordre chronologiques des rapports d'essai."""
+
+    cle = models.CharField(max_length=100, unique=True)
+    valeur = models.PositiveIntegerField(default=0)
+
+    @classmethod
+    def suivant(cls, cle):
+        from django.db import transaction
+
+        with transaction.atomic():
+            compteur, _ = cls.objects.select_for_update().get_or_create(cle=cle)
+            compteur.valeur += 1
+            compteur.save(update_fields=["valeur"])
+            return compteur.valeur
+
+
+class FicheExecutionTravaux(models.Model):
+    """Fiche d'execution des travaux d'essais (FET) — EN 003-PG 002."""
+
+    STATUT_CHOICES = [
+        ("BROUILLON", "Brouillon (réception)"),
+        ("TRANSMISE", "Transmise au laboratoire"),
+        ("RECUE_LABO", "Reçue par le laboratoire"),
+        ("RESULTATS_TRANSMIS", "Résultats transmis à la réception"),
+        ("RESULTATS_RECUS", "Résultats reçus — rapport en préparation"),
+        ("CLOTUREE", "Clôturée (rapports remis)"),
+    ]
+    NATURE_CHOICES = [
+        ("ALIMENTAIRE", "Produits alimentaires"),
+        ("INDUSTRIEL", "Produits industriels"),
+        ("EAUX", "Eaux"),
+        ("AUTRES", "Autres"),
+    ]
+    ACCEPTATION_CHOICES = [("CONFORME", "Conforme"), ("SOUS_RESERVE", "Sous réserve")]
+
+    numero = models.CharField(max_length=50, unique=True, help_text="Année/Direction/N° d'ordre")
+    annee = models.PositiveIntegerField()
+    direction = models.CharField(max_length=20, blank=True)
+    demande = models.ForeignKey("facturation.DemandeAnalyse", on_delete=models.CASCADE, related_name="fiches_travaux")
+    statut = models.CharField(max_length=30, choices=STATUT_CHOICES, default="BROUILLON")
+    nature_objet = models.CharField(max_length=20, choices=NATURE_CHOICES, default="ALIMENTAIRE")
+    nature_precision = models.CharField(max_length=255, blank=True)
+    date_arrivee_lanema = models.DateField(null=True, blank=True)
+    date_transmission_laboratoire = models.DateTimeField(null=True, blank=True)
+    delai_realisation = models.CharField(max_length=255, blank=True)
+    observations = models.TextField(blank=True)
+    # Reception (SRO) des resultats / du rapport transmis par le laboratoire
+    re_receptionne_par = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    date_reception_re = models.DateTimeField(null=True, blank=True)
+    cree_par = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:  # pragma: no cover
+        return self.numero
+
+
+class FETLaboratoire(models.Model):
+    """Suivi d'une fiche par laboratoire concerne : reception, acceptation des
+    echantillons, transmission des resultats."""
+
+    STATUT_CHOICES = [
+        ("TRANSMIS", "Transmis"),
+        ("RECU", "Reçu — en analyse"),
+        ("RESULTATS_TRANSMIS", "Résultats transmis"),
+    ]
+
+    fiche = models.ForeignKey(FicheExecutionTravaux, on_delete=models.CASCADE, related_name="suivis_labo")
+    laboratoire = models.ForeignKey("laboratoires.Laboratoire", on_delete=models.CASCADE, related_name="suivis_fiches")
+    statut = models.CharField(max_length=30, choices=STATUT_CHOICES, default="TRANSMIS")
+    date_reception = models.DateTimeField(null=True, blank=True)
+    receptionne_par = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    acceptation = models.CharField(max_length=20, choices=FicheExecutionTravaux.ACCEPTATION_CHOICES, blank=True)
+    reserves = models.TextField(blank=True)
+    date_transmission_resultats = models.DateTimeField(null=True, blank=True)
+    transmis_par = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+
+    class Meta:
+        unique_together = ("fiche", "laboratoire")
+        ordering = ["laboratoire__code"]
+
+
+class ResultatEssai(models.Model):
+    """Resultat d'un parametre pour un echantillon, saisi par le laboratoire."""
+
+    echantillon = models.ForeignKey(Echantillon, on_delete=models.CASCADE, related_name="resultats")
+    laboratoire = models.ForeignKey("laboratoires.Laboratoire", on_delete=models.CASCADE, related_name="resultats")
+    parametre = models.CharField(max_length=255)
+    methode = models.CharField(max_length=255, blank=True)
+    unite = models.CharField(max_length=50, blank=True)
+    resultat = models.CharField(max_length=255)
+    specification = models.CharField(max_length=255, blank=True, help_text="Limite / critère d'acceptation")
+    conforme = models.BooleanField(null=True, blank=True, help_text="null = sans objet")
+    accredite = models.BooleanField(default=False, help_text="Essai sous accréditation : résultat en gras (**)")
+    sous_traite = models.BooleanField(default=False, help_text="Essai sous-traité : symbole S/T")
+    ordre = models.PositiveIntegerField(default=0)
+    analyste = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    date_analyse = models.DateField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["echantillon_id", "ordre", "id"]
+
+
+class RapportEssaiLabo(models.Model):
+    """Rapport d'essai officiel (EN 001-PG019) : un rapport par fiche et par
+    laboratoire, edite par le service reception a partir des resultats
+    transmis. Le numero d'ordre est chronologique par annee, attribue a
+    l'edition (aucun trou)."""
+
+    STATUT_CHOICES = [
+        ("BROUILLON", "Brouillon"),
+        ("EDITE", "Édité"),
+        ("SIGNE", "Signé"),
+        ("REMIS", "Remis au client"),
+    ]
+
+    fiche = models.ForeignKey(FicheExecutionTravaux, on_delete=models.CASCADE, related_name="rapports")
+    laboratoire = models.ForeignKey("laboratoires.Laboratoire", on_delete=models.PROTECT, related_name="rapports_essai_officiels")
+    statut = models.CharField(max_length=20, choices=STATUT_CHOICES, default="BROUILLON")
+    annee = models.PositiveIntegerField(null=True, blank=True)
+    numero_ordre = models.PositiveIntegerField(null=True, blank=True)
+    reference = models.CharField(max_length=150, blank=True, db_index=True)
+    date_edition = models.DateField(null=True, blank=True)
+    informations_diverses = models.TextField(default="R.A.S", blank=True)
+    directeur_nom = models.CharField(max_length=255, blank=True, help_text="Nom & prénoms du Directeur signataire")
+    date_signature = models.DateField(null=True, blank=True)
+    date_remise = models.DateField(null=True, blank=True)
+    edite_par = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("fiche", "laboratoire")
+        ordering = ["-annee", "-numero_ordre", "-id"]
+        constraints = [
+            models.UniqueConstraint(fields=["annee", "numero_ordre"], name="rapport_essai_numero_ordre_unique_par_annee"),
+        ]

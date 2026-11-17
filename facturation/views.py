@@ -1,16 +1,28 @@
 from datetime import timedelta
 
+from decimal import Decimal, InvalidOperation
+
+from django.core import signing
+from django.core.files.base import ContentFile
+from django.db import transaction
 from django.http import HttpResponse
+from django.urls import reverse
 from django.utils import timezone
 from django.db.models import Sum
 
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import BonCommande, Facture, Proforma, DemandeAnalyse
-from .serializers import BonCommandeSerializer, FactureSerializer, ProformaSerializer, DemandeAnalyseSerializer
+from . import devis_utils, email_service
+from .models import BonCommande, CompteEmailLabo, EmailDevis, Facture, Proforma, DemandeAnalyse
+from .serializers import (
+    BonCommandeSerializer, CompteEmailLaboSerializer, EmailDevisSerializer,
+    FactureSerializer, ProformaSerializer, DemandeAnalyseSerializer,
+)
 from clients.permissions_catalog import user_has_permission
 
 from io import BytesIO
@@ -196,266 +208,531 @@ def _oui_non(value):
     return "Oui" if value else "Non"
 
 
-def _generer_proforma_pdf(proforma):
-    """Construit le PDF du devis (Proforma), reproduisant fidelement le
-    formulaire officiel EN 002-PG002 (Reference, Informations client, tableau
-    des prestations, tableau de prelevement, accreditations, delais/sous-
-    traitance/declaration de conformite, signatures). Reutilise par
-    ProformaViewSet.telecharger_pdf (JSON base64) et .envoyer_devis (piece
-    jointe email)."""
+def _role(user):
+    return getattr(getattr(user, "client_profile", None), "role", None)
 
-    from reportlab.lib import colors
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.units import mm
-    from reportlab.pdfgen import canvas
-    from reportlab.platypus import Table, TableStyle
 
-    buffer = BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4
+def _est_client(user):
+    return _role(user) == "CLIENT"
 
-    primary = colors.HexColor("#0B57A4")
-    ink = colors.HexColor("#1e293b")
-    muted = colors.HexColor("#64748b")
-    LEFT, RIGHT = 16 * mm, width - 16 * mm
-    USABLE_W = RIGHT - LEFT
 
+def _exiger_reception(request):
+    """Reserve aux profils pouvant gerer la reception (service reception, admin)."""
+    if not user_has_permission(request.user, "echantillons.manage"):
+        raise PermissionDenied("Non autorisé")
+
+
+def _tva_rate():
+    from demandes.views import TVA_RATE  # import local : evite un import circulaire
+    return TVA_RATE
+
+
+def _fmt_montant(valeur):
+    try:
+        return f"{float(valeur):,.0f}".replace(",", " ")
+    except (TypeError, ValueError):
+        return str(valeur)
+
+
+def _accepter_proforma(proforma):
+    """Passe la proforma a ACCEPTEE et emet le Bon de Commande + la Facture
+    (mutualise entre l'acceptation simple et l'approbation « Lu et approuvé »
+    du client sur la fiche de devis). Retourne le bon de commande."""
+    proforma.statut = "ACCEPTEE"
+    proforma.save(update_fields=["statut"])
+
+    # Synchroniser le statut du devis associe (utilise par les stats dashboard)
+    if proforma.demande_devis is not None:
+        try:
+            proforma.demande_devis.statut = "ACCEPTEE"
+            proforma.demande_devis.save(update_fields=["statut"])
+        except Exception:
+            pass
+
+    # Emettre simultanement le Bon de Commande et la Facture : le client doit
+    # signer le premier et payer la seconde AVANT que la demande d'analyse ne
+    # soit creee. Les deux documents reprennent le meme suffixe numerique que
+    # la proforma (DEV-00013 -> PROF-00013 -> BC-00013 / FAC-00013 -> DA-00013).
+    suffixe = proforma.numero.split("-")[-1]
+
+    bon_commande = BonCommande.objects.filter(proforma=proforma).first()
+    if bon_commande is None:
+        bc_numero = f"BC-{suffixe}"
+        if BonCommande.objects.filter(numero=bc_numero).exists():
+            bc_numero = f"BC-{BonCommande.objects.count() + 1:05d}"
+        bon_commande = BonCommande.objects.create(
+            numero=bc_numero, client=proforma.client, proforma=proforma,
+            montant_ht=proforma.montant_ht, montant_ttc=proforma.montant_ttc,
+            devise=proforma.devise, statut="EMIS",
+        )
+
+    if not Facture.objects.filter(proforma=proforma).exists():
+        fac_numero = f"FAC-{suffixe}"
+        if Facture.objects.filter(numero=fac_numero).exists():
+            fac_numero = f"FAC-{Facture.objects.count() + 1:05d}"
+        date_emission = timezone.now().date()
+        Facture.objects.create(
+            numero=fac_numero, client=proforma.client, proforma=proforma, bon_commande=bon_commande,
+            montant_ht=proforma.montant_ht, montant_ttc=proforma.montant_ttc, devise=proforma.devise,
+            statut="EN_ATTENTE", date_emission=date_emission,
+            date_echeance=date_emission + timedelta(days=30), visible_client=True,
+        )
+    return bon_commande
+
+
+def _signer_bon_commande(bon_commande, signature_file):
+    """Applique la signature du client sur le bon de commande ; le bon signe
+    vaut validation du devis : la demande d'analyse peut etre creee."""
+    bon_commande.signature_client_image = signature_file
+    bon_commande.date_signature_client = timezone.now().date()
+    bon_commande.statut = "SIGNE_CLIENT"
+    bon_commande.save(update_fields=["signature_client_image", "date_signature_client", "statut"])
+    facture = Facture.objects.filter(bon_commande=bon_commande).first()
+    if facture is not None:
+        _creer_demande_analyse_si_absente(facture)
+
+
+def _lien_pdf_public(request, proforma):
+    token = signing.dumps({"p": proforma.pk}, salt="devis-pdf-public")
+    chemin = reverse("proforma-pdf-public", args=[proforma.pk])
+    return request.build_absolute_uri(f"{chemin}?token={token}")
+
+
+def _fiche_devis(proforma, request):
+    """Structure complete de la fiche de devis (formulaire EN 002-PG002)."""
     demande = proforma.demande_devis
-    client_profile = getattr(proforma.client, "client_profile", None)
+    client = proforma.client
+    profil = getattr(client, "client_profile", None)
+    t = devis_utils.totaux(proforma)
 
-    # ── Header ────────────────────────────────────────────────────────────
-    c.setFillColor(primary)
-    c.rect(0, height - 28 * mm, width, 28 * mm, fill=1, stroke=0)
-    c.setFillColor(colors.white)
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(LEFT, height - 13 * mm, "LANEMA")
-    c.setFont("Helvetica", 7)
-    c.drawString(LEFT, height - 18 * mm, "Laboratoire National d'Essais de Qualité, de Métrologie et d'Analyses")
-    c.setFont("Helvetica-Bold", 18)
-    c.drawRightString(RIGHT, height - 15 * mm, "DEVIS")
-    c.setFillColor(colors.black)
+    def img_url(f):
+        if not f:
+            return None
+        return request.build_absolute_uri(f.url)
 
-    y = height - 34 * mm
-    c.setFont("Helvetica", 8)
-    c.setFillColor(ink)
-    direction_nom = (demande.type_analyse if demande else "") or ""
-    c.drawString(LEFT, y, f"Réf : {proforma.numero} / {proforma.date_emission.year if proforma.date_emission else ''} / LANEMA / {direction_nom}")
-    c.drawRightString(RIGHT, y, f"Abidjan, le {proforma.date_emission.strftime('%d/%m/%Y') if proforma.date_emission else ''}")
-    y -= 6 * mm
+    lignes = []
+    for e in devis_utils.lignes_prestations(demande):
+        pu = Decimal(e.prix_unitaire or 0)
+        lignes.append({
+            "id": e.id, "nom": e.nom, "methode_utilisee": e.methode_utilisee,
+            "prix_unitaire": pu, "quantite": e.quantite, "sous_traite": e.sous_traite, "accredite": e.accredite,
+            "montant": pu * e.quantite, "details": e.details or {},
+        })
+    interventions = []
+    for code, label, i in devis_utils.interventions_completes(demande):
+        interventions.append({
+            "designation": code, "designation_display": label,
+            "duree_heures": i.duree_heures if i else None, "km": i.km if i else None,
+            "nombre": i.nombre if i else 0, "prix_unitaire": i.prix_unitaire if i else 0,
+            "montant": i.montant if i else 0,
+        })
 
-    # ── Informations client ─────────────────────────────────────────────
-    c.setFillColor(colors.HexColor("#F3F6FB"))
-    c.rect(LEFT, y - 2 * mm, USABLE_W, 4.5 * mm, fill=1, stroke=0)
-    c.setFillColor(primary)
-    c.setFont("Helvetica-Bold", 8)
-    c.drawString(LEFT + 2 * mm, y, "INFORMATIONS CLIENT")
-    y -= 5 * mm
+    figee = proforma.lu_approuve or proforma.statut in ("ACCEPTEE", "REFUSEE", "ANNULEE")
+    reference_type = demande.type_analyse if demande else ""
+    return {
+        "proforma": {
+            "id": proforma.id, "numero": proforma.numero, "statut": proforma.statut,
+            "statut_display": proforma.get_statut_display(), "date_emission": proforma.date_emission,
+            "devise": proforma.devise, "envoye_le": proforma.envoye_le, "canal_envoi": proforma.canal_envoi,
+            "lu_approuve": proforma.lu_approuve, "lu_approuve_le": proforma.lu_approuve_le,
+            "lu_approuve_signature_url": img_url(proforma.lu_approuve_signature),
+            "valide_par_responsable_nom": (
+                (proforma.valide_par_responsable.get_full_name() or proforma.valide_par_responsable.username)
+                if proforma.valide_par_responsable else None
+            ),
+        },
+        "reference": devis_utils.reference_devis(proforma),
+        "client": {
+            "domaine_activite": getattr(profil, "domaine_activite", "") or "",
+            "raison_sociale": getattr(profil, "raison_sociale", "") or client.get_full_name() or client.username,
+            "adresse": getattr(profil, "adresse", "") or "",
+            "situation_geographique": getattr(profil, "situation_geographique", "") or "",
+            "telephone": getattr(profil, "telephone", "") or "",
+            "code_client": getattr(profil, "code_client", "") or "",
+            "contact_nom": getattr(profil, "contact_nom", "") or "",
+            "email": client.email,
+        },
+        "demande": {
+            "id": demande.id if demande else None,
+            "numero": demande.numero if demande else "",
+            "date_demande": demande.created_at if demande else None,
+            "objet": demande.objet if demande else "",
+            "type_analyse": demande.type_analyse if demande else "",
+            "categorie": demande.categorie if demande else "",
+            "delai_realisation_jours": demande.delai_realisation_jours if demande else None,
+            "accord_sous_traitance": demande.accord_sous_traitance if demande else False,
+            "sous_traitants_choisis": [
+                {"id": st.id, "nom": st.nom, "specialite": st.specialite, "contact": st.contact}
+                for st in (demande.sous_traitants_choisis.all() if demande else [])
+            ],
+            "sous_traitants_souhaits_libres": demande.sous_traitants_souhaits_libres if demande else "",
+            "retour_materiel_gere_labo": demande.retour_materiel_gere_labo if demande else None,
+            "lieu_realisation": demande.lieu_realisation if demande else "LABORATOIRE",
+            "observations_particulieres": demande.observations_particulieres if demande else "",
+            "declaration_conformite_souhaitee": demande.declaration_conformite_souhaitee if demande else None,
+            "regle_decision": demande.regle_decision if demande else "",
+        },
+        "lignes": lignes,
+        "interventions": interventions,
+        "totaux": {**t, "taux_tva": _tva_rate()},
+        "montant_en_lettres": devis_utils.montant_en_lettres(t["montant_ttc"], proforma.devise),
+        "accreditations": devis_utils.ACCREDITATIONS,
+        "modifiable": not figee,
+        "envois": EmailDevisSerializer(proforma.envois.all()[:10], many=True).data,
+    }
 
-    info_rows = [
-        ("Domaine(s) d'activité(s)", getattr(client_profile, "domaine_activite", "") or "-"),
-        ("Raison sociale", getattr(client_profile, "raison_sociale", "") or proforma.client.get_full_name() or proforma.client.username),
-        ("Adresse", getattr(client_profile, "adresse", "") or "-"),
-        ("Situation géographique", getattr(client_profile, "situation_geographique", "") or "-"),
-        ("Tél", getattr(client_profile, "telephone", "") or "-"),
-        ("Code client", getattr(client_profile, "code_client", "") or "-"),
-        ("Personne à contacter", getattr(client_profile, "contact_nom", "") or "-"),
-        ("E-mail", proforma.client.email),
-        ("Date de la demande", demande.created_at.strftime("%d/%m/%Y") if demande else ""),
-        ("Nature de l'objet", (demande.objet if demande else "") or "-"),
-    ]
-    c.setFont("Helvetica", 8)
-    for label, value in info_rows:
-        c.setFillColor(muted)
-        c.drawString(LEFT + 2 * mm, y, f"{label} :")
-        c.setFillColor(ink)
-        c.drawString(LEFT + 58 * mm, y, str(value)[:70])
-        y -= 4.2 * mm
-    y -= 2 * mm
 
-    # ── Table 1 : Prestations d'essais/étalonnage/vérification ─────────
-    c.setFont("Helvetica-Bold", 8)
-    c.setFillColor(ink)
-    c.drawString(LEFT, y, "1 - Prestations d'essais / étalonnage / vérification")
-    y -= 5 * mm
+def _generer_proforma_pdf(proforma):
+    """PDF du devis conforme au formulaire officiel EN 002-PG002 (cf. pdf_devis.py)."""
+    from .pdf_devis import devis_pdf
 
-    lignes = list(demande.echantillons_prevus.all()) if demande else []
-    data1 = [["Paramètres ou Grandeurs", "Méthodes utilisées", "P.U.", "Nombre", "Montant"]]
-    total1 = 0
-    for e in lignes[:8]:
-        pu = float(e.prix_unitaire) if e.prix_unitaire is not None else 0
-        montant = pu * e.quantite
-        total1 += montant
-        nom = f"{e.nom}{' (ST)' if e.sous_traite else ''}"
-        data1.append([nom, e.methode_utilisee or "-", f"{pu:,.0f}".replace(",", " "), str(e.quantite), f"{montant:,.0f}".replace(",", " ")])
-    if not lignes:
-        data1.append(["-", "-", "-", "-", "-"])
-    data1.append(["", "", "", "SOUS TOTAL 1 (H.T.)", f"{total1:,.0f}".replace(",", " ")])
-
-    table1 = Table(data1, colWidths=[58 * mm, 45 * mm, 22 * mm, 20 * mm, 29 * mm])
-    table1.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), primary),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 7.5),
-        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#C9D7EE")),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("ALIGN", (2, 0), (-1, -1), "RIGHT"),
-        ("SPAN", (0, -1), (2, -1)),
-    ]))
-    tw, th = table1.wrapOn(c, USABLE_W, 100 * mm)
-    table1.drawOn(c, LEFT, y - th)
-    y -= th + 5 * mm
-
-    # ── Table 2 : Prélèvement ou récupération de l'appareil de mesure ──
-    c.setFont("Helvetica-Bold", 8)
-    c.drawString(LEFT, y, "2 - Prélèvement ou récupération de l'appareil de mesure")
-    y -= 5 * mm
-
-    data2 = [["Désignation", "Durée (h)", "Km", "Nombre", "P.U.", "Montant"]]
-    interventions = {i.designation: i for i in (demande.interventions_prelevement.all() if demande else [])}
-    total2 = 0
-    for code, label in [
-        ("INGENIEUR", "Intervention d'un ingénieur"), ("TECHNICIEN", "Intervention d'un technicien"),
-        ("CHAUFFEUR", "Intervention d'un chauffeur"), ("VEHICULE", "Coût du véhicule d'intervention"),
-        ("DEPLACEMENT", "Coût de déplacement"),
-    ]:
-        ligne = interventions.get(code)
-        if ligne and (ligne.nombre or ligne.prix_unitaire):
-            montant = float(ligne.montant)
-            total2 += montant
-            data2.append([
-                label, f"{ligne.duree_heures}" if ligne.duree_heures else "-", f"{ligne.km}" if ligne.km else "-",
-                str(ligne.nombre), f"{ligne.prix_unitaire:,.0f}".replace(",", " "), f"{montant:,.0f}".replace(",", " "),
-            ])
-        else:
-            data2.append([label, "-", "-", "-", "-", "-"])
-    data2.append(["", "", "", "", "SOUS TOTAL 2 (H.T.)", f"{total2:,.0f}".replace(",", " ")])
-
-    table2 = Table(data2, colWidths=[62 * mm, 20 * mm, 18 * mm, 18 * mm, 24 * mm, 32 * mm])
-    table2.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), primary),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 7.5),
-        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#C9D7EE")),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
-        ("SPAN", (0, -1), (3, -1)),
-    ]))
-    tw2, th2 = table2.wrapOn(c, USABLE_W, 60 * mm)
-    table2.drawOn(c, LEFT, y - th2)
-    y -= th2 + 5 * mm
-
-    # ── Accreditations (reference statique) + Totaux ───────────────────
-    acc_w = 110 * mm
-    tot_w = USABLE_W - acc_w - 4 * mm
-    acc_data = [
-        ["Grandeurs", "N° Acc", "Portée Acc"],
-        ["UDT", "ET-19001", "Chaîne : -20°C à 600°C / Enc : -20°C à 150°C"],
-        ["UDP", "ET-19001-1", "Hyd : 0 bar à 1200 bar / Pne : 1 bar à 20 bars"],
-        ["LEE", "ES 20001", "Ph, Ca, Mg, Cl-, Ip, NO2, NO3, C, Cd, Al"],
-    ]
-    acc_table = Table(acc_data, colWidths=[18 * mm, 22 * mm, acc_w - 40 * mm])
-    acc_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E2E8F0")),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 6.5),
-        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#C9D7EE")),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-    ]))
-    tw3, th3 = acc_table.wrapOn(c, acc_w, 30 * mm)
-    acc_table.drawOn(c, LEFT, y - th3)
-
-    tva = (float(proforma.montant_ttc) - float(proforma.montant_ht)) if proforma.montant_ttc is not None and proforma.montant_ht is not None else 0
-    tot_data = [
-        ["TOTAL H.T.", f"{proforma.montant_ht} {proforma.devise}"],
-        ["Remise", "-"],
-        ["Montant H.T.", f"{proforma.montant_ht} {proforma.devise}"],
-        ["T.V.A.", f"{tva:.0f} {proforma.devise}"],
-        ["TOTAL T.T.C.", f"{proforma.montant_ttc} {proforma.devise}"],
-    ]
-    tot_table = Table(tot_data, colWidths=[tot_w * 0.5, tot_w * 0.5])
-    tot_table.setStyle(TableStyle([
-        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 7.5),
-        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#C9D7EE")),
-        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-    ]))
-    tw4, th4 = tot_table.wrapOn(c, tot_w, 30 * mm)
-    tot_table.drawOn(c, LEFT + acc_w + 4 * mm, y - th4)
-
-    y -= max(th3, th4) + 6 * mm
-
-    # ── Champs bas de formulaire ─────────────────────────────────────────
-    c.setFont("Helvetica", 8)
-    bottom_rows = [
-        ("Délais de réalisation", f"{demande.delai_realisation_jours} jours ouvrés" if demande and demande.delai_realisation_jours else "24h ouvrées"),
-        ("Accord de Sous-traitance", _oui_non(demande.accord_sous_traitance if demande else None)),
-        ("Le laboratoire doit-il gérer le renvoi du matériel", _oui_non(demande.retour_materiel_gere_labo if demande else None)),
-        ("Lieu de réalisation des Travaux", dict(demande.LIEU_REALISATION_CHOICES).get(demande.lieu_realisation, "Laboratoire") if demande else "Laboratoire"),
-        ("Observations particulières", (demande.observations_particulieres if demande else "") or "-"),
-        ("Déclaration de Conformité", _oui_non(demande.declaration_conformite_souhaitee if demande else None)),
-        ("Règle de décision", (demande.regle_decision if demande else "") or "-"),
-    ]
-    for label, value in bottom_rows:
-        c.setFillColor(muted)
-        c.drawString(LEFT, y, f"{label} :")
-        c.setFillColor(ink)
-        c.drawString(LEFT + 75 * mm, y, str(value)[:55])
-        y -= 4.2 * mm
-
-    if demande and demande.accord_sous_traitance:
-        sous_traitants = ", ".join(demande.sous_traitants_choisis.values_list("nom", flat=True))
-        if sous_traitants or demande.sous_traitants_souhaits_libres:
-            c.setFillColor(muted)
-            c.drawString(LEFT, y, "Sous-traitant(s) :")
-            c.setFillColor(ink)
-            texte = sous_traitants or demande.sous_traitants_souhaits_libres
-            c.drawString(LEFT + 75 * mm, y, str(texte)[:55])
-            y -= 4.2 * mm
-
-    y -= 2 * mm
-    c.setFont("Helvetica-Bold", 9)
-    c.setFillColor(ink)
-    c.drawString(LEFT, y, f"Arrêté le présent devis à la somme de : {proforma.montant_ttc} {proforma.devise} (T.T.C.)")
-    y -= 10 * mm
-
-    # ── Signatures ────────────────────────────────────────────────────
-    bon_commande = proforma.bons_commande.filter(statut="SIGNE_CLIENT").order_by("-date_signature_client").first()
-    c.setFont("Helvetica", 8)
-    c.setFillColor(ink)
-    c.drawString(LEFT, y, "Le Client")
-    if bon_commande is not None:
-        _draw_client_signature(c, LEFT, y - 6 * mm, bon_commande)
-    else:
-        c.setFont("Helvetica-Oblique", 7)
-        c.setFillColor(muted)
-        c.drawString(LEFT, y - 10 * mm, "(non signé)")
-
-    _draw_responsable_signature(c, LEFT + 100 * mm, y, proforma)
-    c.setFillColor(colors.black)
-
-    # Footer
-    c.setFont("Helvetica-Oblique", 8)
-    c.setFillColor(colors.HexColor("#2D7EDB"))
-    c.drawCentredString(width / 2, 12 * mm, "Avant utilisation d'un document, vérifier sa validité — EN 002-PG002")
-    c.setFillColor(colors.black)
-
-    c.showPage()
-    c.save()
-
-    pdf_bytes = buffer.getvalue()
-    buffer.close()
-    return pdf_bytes
+    return devis_pdf(proforma)
 
 
 class ProformaViewSet(viewsets.ModelViewSet):
     queryset = Proforma.objects.select_related("client").all()
     serializer_class = ProformaSerializer
     permission_classes = [permissions.IsAuthenticated]
+    parser_classes = [JSONParser, MultiPartParser, FormParser]
+
+    # ── Perimetre : un client ne voit et ne manipule que ses propres devis ──
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if _est_client(user):
+            qs = qs.filter(client=user)
+        statut = self.request.query_params.get("statut")
+        if statut:
+            qs = qs.filter(statut__in=[s for s in statut.split(",") if s])
+        return qs
+
+    def _refuser_si_client(self):
+        if _est_client(self.request.user):
+            raise PermissionDenied("Non autorisé")
+
+    def perform_create(self, serializer):
+        self._refuser_si_client()
+        super().perform_create(serializer)
+
+    def perform_update(self, serializer):
+        self._refuser_si_client()
+        super().perform_update(serializer)
+
+    def perform_destroy(self, instance):
+        self._refuser_si_client()
+        super().perform_destroy(instance)
+
+    # ── Fiche de devis (formulaire EN 002-PG002) ────────────────────────────
+    @action(detail=True, methods=["get"], url_path="fiche")
+    def fiche(self, request, pk=None):
+        """Fiche de devis complete : consultation par le client (espace client)
+        et edition par le service reception."""
+        proforma = self.get_object()
+        return Response(_fiche_devis(proforma, request))
+
+    @action(detail=True, methods=["post"], url_path="enregistrer_fiche")
+    def enregistrer_fiche(self, request, pk=None):
+        """Service reception : complete la fiche (methodes, prix, prelevement,
+        remise, conditions) puis recalcule les montants HT / TVA / TTC."""
+        _exiger_reception(request)
+        proforma = self.get_object()
+        demande = proforma.demande_devis
+        if demande is None:
+            return Response({"detail": "Ce devis n'est rattaché à aucune demande."}, status=status.HTTP_400_BAD_REQUEST)
+        if proforma.lu_approuve or proforma.statut in ("ACCEPTEE", "REFUSEE", "ANNULEE"):
+            return Response(
+                {"detail": "Le devis est approuvé ou clôturé : il ne peut plus être modifié."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        data = request.data if isinstance(request.data, dict) else {}
+
+        def dec(valeur, defaut="0"):
+            try:
+                if valeur in (None, ""):
+                    return Decimal(defaut)
+                v = Decimal(str(valeur))
+                if v < 0:
+                    raise InvalidOperation
+                return v
+            except InvalidOperation:
+                raise ValueError("Valeur numérique invalide")
+
+        try:
+            lignes = data.get("lignes")
+            if lignes is not None:
+                if not isinstance(lignes, list) or not lignes:
+                    return Response({"detail": "Au moins une prestation est requise."}, status=status.HTTP_400_BAD_REQUEST)
+                existantes = {e.id: e for e in demande.echantillons_prevus.all()}
+                conserves = set()
+                for l in lignes:
+                    nom = (l.get("nom") or "").strip()
+                    if not nom:
+                        return Response({"detail": "Chaque prestation doit avoir une désignation."}, status=status.HTTP_400_BAD_REQUEST)
+                    qte = int(l.get("quantite") or 1)
+                    if qte < 1:
+                        return Response({"detail": "Le nombre doit être supérieur ou égal à 1."}, status=status.HTTP_400_BAD_REQUEST)
+                    champs = {
+                        "nom": nom[:255], "quantite": qte,
+                        "methode_utilisee": (l.get("methode_utilisee") or "")[:255],
+                        "prix_unitaire": dec(l.get("prix_unitaire")),
+                        "sous_traite": bool(l.get("sous_traite")), "accredite": bool(l.get("accredite")),
+                    }
+                    ligne = existantes.get(l.get("id"))
+                    if ligne is not None:
+                        for k, v in champs.items():
+                            setattr(ligne, k, v)
+                        ligne.save()
+                        conserves.add(ligne.id)
+                    else:
+                        conserves.add(demande.echantillons_prevus.create(**champs).id)
+                demande.echantillons_prevus.exclude(id__in=conserves).delete()
+
+            interventions = data.get("interventions")
+            if interventions is not None:
+                valides = dict(devis_utils.DESIGNATIONS_PRELEVEMENT)
+                for l in interventions:
+                    code = l.get("designation")
+                    if code not in valides:
+                        continue
+                    demande.interventions_prelevement.update_or_create(
+                        designation=code,
+                        defaults={
+                            "duree_heures": dec(l.get("duree_heures"), "0") or None,
+                            "km": dec(l.get("km"), "0") or None,
+                            "nombre": int(l.get("nombre") or 0),
+                            "prix_unitaire": dec(l.get("prix_unitaire")),
+                        },
+                    )
+
+            conditions = data.get("conditions") or {}
+            champs_demande = []
+            if "delai_realisation_jours" in conditions:
+                d = conditions.get("delai_realisation_jours")
+                demande.delai_realisation_jours = int(d) if d not in (None, "") else None
+                champs_demande.append("delai_realisation_jours")
+            for cle in ("accord_sous_traitance", "retour_materiel_gere_labo", "declaration_conformite_souhaitee"):
+                if cle in conditions:
+                    v = conditions.get(cle)
+                    setattr(demande, cle, None if v in (None, "") else bool(v))
+                    champs_demande.append(cle)
+            if conditions.get("lieu_realisation") in dict(demande.LIEU_REALISATION_CHOICES):
+                demande.lieu_realisation = conditions["lieu_realisation"]
+                champs_demande.append("lieu_realisation")
+            for cle in ("observations_particulieres", "regle_decision"):
+                if cle in conditions:
+                    setattr(demande, cle, (conditions.get(cle) or "")[:2000 if cle == "observations_particulieres" else 255])
+                    champs_demande.append(cle)
+            if champs_demande:
+                demande.save(update_fields=list(set(champs_demande)))
+
+            if "remise" in data:
+                proforma.remise = dec(data.get("remise"))
+            proforma.edite_par = request.user
+            proforma.save(update_fields=["remise", "edite_par"])
+        except (ValueError, TypeError) as exc:
+            return Response({"detail": str(exc) or "Données invalides."}, status=status.HTTP_400_BAD_REQUEST)
+
+        proforma.refresh_from_db()
+        devis_utils.recalculer_montants(proforma, _tva_rate())
+        return Response(_fiche_devis(proforma, request))
+
+    # ── Envoi du devis : e-mail integre et WhatsApp ─────────────────────────
+    @action(detail=True, methods=["get"], url_path="email_preparation")
+    def email_preparation(self, request, pk=None):
+        """Valeurs proposees dans le formulaire d'envoi par e-mail."""
+        _exiger_reception(request)
+        proforma = self.get_object()
+        sujet, corps = email_service.message_devis_par_defaut(proforma)
+        comptes = CompteEmailLabo.objects.filter(utilisateur=request.user, actif=True)
+        return Response({
+            "destinataire": proforma.client.email,
+            "sujet": sujet,
+            "corps": corps,
+            "pdf_nom": f"Devis_{proforma.numero}.pdf",
+            "comptes": [
+                {"id": c.id, "nom_affichage": c.nom_affichage, "adresse_email": c.adresse_email,
+                 "est_principal": c.est_principal, "signature": c.signature}
+                for c in comptes
+            ],
+            "deja_envoye": proforma.envoye_le is not None,
+        })
+
+    @action(detail=True, methods=["post"], url_path="envoyer_email")
+    def envoyer_email(self, request, pk=None):
+        """Envoie le devis par e-mail (formulaire integre a l'application) avec
+        le PDF du devis et d'eventuelles pieces jointes supplementaires."""
+        _exiger_reception(request)
+        proforma = self.get_object()
+
+        destinataires = email_service.parse_adresses(request.data.get("destinataires"))
+        cc = email_service.parse_adresses(request.data.get("cc"))
+        sujet = (request.data.get("sujet") or "").strip()
+        corps = (request.data.get("corps") or "").strip()
+        joindre = str(request.data.get("joindre_devis", "true")).lower() not in ("false", "0", "")
+
+        if not destinataires:
+            return Response({"detail": "Indiquez au moins un destinataire."}, status=status.HTTP_400_BAD_REQUEST)
+        invalides = email_service.adresses_invalides(destinataires + cc)
+        if invalides:
+            return Response({"detail": f"Adresse(s) invalide(s) : {', '.join(invalides)}"}, status=status.HTTP_400_BAD_REQUEST)
+        if not sujet or not corps:
+            return Response({"detail": "L'objet et le message sont requis."}, status=status.HTTP_400_BAD_REQUEST)
+
+        comptes = CompteEmailLabo.objects.filter(utilisateur=request.user, actif=True)
+        compte_id = request.data.get("compte")
+        compte = (comptes.filter(id=compte_id).first() if compte_id else None) or comptes.first()
+        if compte is None:
+            return Response(
+                {"detail": "Aucun compte d'envoi configuré. Renseignez-le dans Paramètres > Messagerie.", "code": "NO_ACCOUNT"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        pieces = []
+        if joindre:
+            pieces.append((f"Devis_{proforma.numero}.pdf", _generer_proforma_pdf(proforma), "application/pdf"))
+        taille = 0
+        fichiers = request.FILES.getlist("pieces")
+        if len(fichiers) > 5:
+            return Response({"detail": "5 pièces jointes maximum."}, status=status.HTTP_400_BAD_REQUEST)
+        for f in fichiers:
+            taille += f.size
+            if taille > 10 * 1024 * 1024:
+                return Response({"detail": "Les pièces jointes dépassent 10 Mo."}, status=status.HTTP_400_BAD_REQUEST)
+            pieces.append((f.name, f.read(), f.content_type or "application/octet-stream"))
+
+        resultat = email_service.envoyer(compte, destinataires, cc, sujet, corps, pieces)
+
+        EmailDevis.objects.create(
+            proforma=proforma, canal="EMAIL", envoye_par=request.user, compte=compte,
+            destinataires=destinataires, destinataires_cc=cc, sujet=sujet, corps=corps,
+            pdf_joint=joindre, nb_pieces_jointes=len(fichiers),
+            statut="ENVOYE" if resultat["success"] else "ECHEC",
+            erreur="" if resultat["success"] else resultat["message"],
+        )
+        if not resultat["success"]:
+            return Response({"detail": resultat["message"]}, status=status.HTTP_400_BAD_REQUEST)
+
+        self._marquer_envoye(proforma, "EMAIL")
+        return Response({"detail": resultat["message"], "statut": proforma.statut})
+
+    def _marquer_envoye(self, proforma, canal):
+        proforma.envoye_le = timezone.now()
+        proforma.canal_envoi = canal
+        champs = ["envoye_le", "canal_envoi"]
+        if proforma.edite_par_id is None:
+            proforma.edite_par = self.request.user
+            champs.append("edite_par")
+        if proforma.statut in ("BROUILLON", "VALIDEE"):
+            proforma.statut = "ENVOYEE"
+            champs.append("statut")
+        proforma.save(update_fields=champs)
+
+    @action(detail=True, methods=["get"], url_path="whatsapp_preparation")
+    def whatsapp_preparation(self, request, pk=None):
+        """Message et lien WhatsApp (wa.me) pre-remplis. L'API WhatsApp ne
+        permet pas de joindre un fichier automatiquement : le message contient
+        un lien securise (valable 30 jours) vers le PDF du devis."""
+        _exiger_reception(request)
+        proforma = self.get_object()
+        profil = getattr(proforma.client, "client_profile", None)
+        telephone = getattr(profil, "telephone", "") or ""
+        numero = email_service.normaliser_telephone_whatsapp(telephone)
+        nom = (getattr(profil, "contact_nom", "") or getattr(profil, "raison_sociale", "")
+               or proforma.client.get_full_name() or "").strip()
+        lien = _lien_pdf_public(request, proforma)
+        message = (
+            f"Bonjour{' ' + nom if nom else ''}, voici votre devis {proforma.numero} de LANEMA "
+            f"d'un montant de {_fmt_montant(proforma.montant_ttc)} {proforma.devise} TTC.\n\n"
+            f"Télécharger le devis : {lien}\n\n"
+            "Pour l'accepter, ouvrez la fiche de devis dans votre espace client LANEMA et apposez la "
+            "mention « Lu et approuvé » avec votre signature.\n\n"
+            "Service Réception — LANEMA"
+        )
+        from urllib.parse import quote
+        wa_url = f"https://wa.me/{numero}?text={quote(message)}" if numero else f"https://wa.me/?text={quote(message)}"
+        return Response({
+            "telephone": telephone, "telephone_international": numero,
+            "message": message, "lien_pdf": lien, "wa_url": wa_url,
+        })
+
+    @action(detail=True, methods=["post"], url_path="marquer_envoye")
+    def marquer_envoye(self, request, pk=None):
+        """Enregistre l'envoi par WhatsApp (declenche au clic sur le bouton)."""
+        _exiger_reception(request)
+        proforma = self.get_object()
+        message = (request.data.get("message") or "").strip()
+        profil = getattr(proforma.client, "client_profile", None)
+        EmailDevis.objects.create(
+            proforma=proforma, canal="WHATSAPP", envoye_par=request.user,
+            destinataires=[getattr(profil, "telephone", "") or ""], sujet=f"Devis {proforma.numero} (WhatsApp)",
+            corps=message, pdf_joint=False,
+        )
+        self._marquer_envoye(proforma, "WHATSAPP")
+        return Response({"detail": "Envoi enregistré", "statut": proforma.statut})
+
+    @action(detail=True, methods=["get"], url_path="historique_envois")
+    def historique_envois(self, request, pk=None):
+        _exiger_reception(request)
+        proforma = self.get_object()
+        return Response(EmailDevisSerializer(proforma.envois.all(), many=True).data)
+
+    @action(
+        detail=True, methods=["get"], url_path="pdf_public", url_name="pdf-public",
+        permission_classes=[permissions.AllowAny], authentication_classes=[],
+    )
+    def pdf_public(self, request, pk=None):
+        """PDF du devis accessible par lien signe (envoi WhatsApp) — valable 30 jours."""
+        try:
+            payload = signing.loads(request.query_params.get("token", ""), salt="devis-pdf-public", max_age=30 * 24 * 3600)
+            proforma = Proforma.objects.select_related("client", "demande_devis").get(pk=payload["p"])
+        except (signing.BadSignature, Proforma.DoesNotExist, KeyError):
+            return HttpResponse("Lien invalide ou expiré.", status=403, content_type="text/plain; charset=utf-8")
+        if str(proforma.pk) != str(pk):
+            return HttpResponse("Lien invalide ou expiré.", status=403, content_type="text/plain; charset=utf-8")
+        reponse = HttpResponse(_generer_proforma_pdf(proforma), content_type="application/pdf")
+        reponse["Content-Disposition"] = f'inline; filename="Devis_{proforma.numero}.pdf"'
+        return reponse
+
+    # ── « Lu et approuve » par le client sur la fiche de devis ─────────────
+    @action(detail=True, methods=["post"], url_path="lu_et_approuve")
+    def lu_et_approuve(self, request, pk=None):
+        """Le client appose la mention « Lu et approuvé » et sa signature sur la
+        fiche de devis : vaut acceptation du devis. Emet le bon de commande
+        (signe) et la facture."""
+        proforma = self.get_object()
+        if proforma.client_id != request.user.id:
+            raise PermissionDenied("Seul le client destinataire peut approuver ce devis.")
+        if proforma.lu_approuve:
+            return Response({"detail": "Ce devis a déjà été approuvé."}, status=status.HTTP_400_BAD_REQUEST)
+        if proforma.statut not in ("VALIDEE", "ENVOYEE"):
+            return Response(
+                {"detail": "Ce devis n'est pas encore disponible à l'approbation."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        mention = (request.data.get("mention") or "").strip().lower().replace("é", "e").replace("’", "'")
+        if " ".join(mention.split()) != "lu et approuve":
+            return Response(
+                {"detail": "Saisissez la mention « Lu et approuvé » pour valider le devis."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        signature = request.FILES.get("signature")
+        if signature is None:
+            return Response({"detail": "La signature du client est requise."}, status=status.HTTP_400_BAD_REQUEST)
+        contenu = signature.read()
+
+        with transaction.atomic():
+            proforma.lu_approuve = True
+            proforma.lu_approuve_le = timezone.now()
+            proforma.lu_approuve_par = request.user
+            proforma.lu_approuve_signature.save(f"lu_approuve_{proforma.numero}.png", ContentFile(contenu), save=False)
+            proforma.save(update_fields=["lu_approuve", "lu_approuve_le", "lu_approuve_par", "lu_approuve_signature"])
+            bon_commande = _accepter_proforma(proforma)
+            _signer_bon_commande(bon_commande, ContentFile(contenu, name=f"signature_{bon_commande.numero}.png"))
+
+        proforma.refresh_from_db()
+        return Response(_fiche_devis(proforma, request))
+
 
     @action(detail=True, methods=["post"], url_path="valider")
     def valider(self, request, pk=None):
@@ -610,71 +887,12 @@ class ProformaViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="accepter")
     def accepter(self, request, pk=None):
-        """Accepter une proforma côté client.
-
-        Met le statut à ACCEPTEE. La création de la Demande d'Analyse
-        associée pourra être gérée ici ou dans un autre module.
-        """
+        """Accepter une proforma (statut ACCEPTEE) et emettre le bon de
+        commande + la facture. Cote client, l'acceptation passe normalement par
+        la mention « Lu et approuvé » sur la fiche de devis (lu_et_approuve)."""
 
         proforma = self.get_object()
-        proforma.statut = "ACCEPTEE"
-        proforma.save(update_fields=["statut"])
-
-        # Synchroniser le statut du devis associé (utilisé par les stats dashboard)
-        if proforma.demande_devis is not None:
-            try:
-                proforma.demande_devis.statut = "ACCEPTEE"
-                proforma.demande_devis.save(update_fields=["statut"])
-            except Exception:
-                pass
-
-        # Emettre simultanement le Bon de Commande et la Facture : le client doit
-        # signer le premier et payer la seconde AVANT que la demande d'analyse
-        # ne soit creee (la reception des echantillons n'intervient qu'apres
-        # validation du paiement, cf. FactureViewSet.valider_paiement).
-        #
-        # Les deux documents reprennent le meme suffixe numerique que la
-        # proforma (elle-meme alignee sur la demande de devis, cf.
-        # DemandeDevisViewSet.perform_create) : DEV-00013 -> PROF-00013 ->
-        # BC-00013 / FAC-00013 -> DA-00013, pour qu'un dossier reste
-        # identifiable par un seul numero a travers tout le circuit.
-        suffixe = proforma.numero.split("-")[-1]
-
-        bon_commande = BonCommande.objects.filter(proforma=proforma).first()
-        if bon_commande is None:
-            bc_numero = f"BC-{suffixe}"
-            if BonCommande.objects.filter(numero=bc_numero).exists():
-                bc_numero = f"BC-{BonCommande.objects.count() + 1:05d}"
-            bon_commande = BonCommande.objects.create(
-                numero=bc_numero,
-                client=proforma.client,
-                proforma=proforma,
-                montant_ht=proforma.montant_ht,
-                montant_ttc=proforma.montant_ttc,
-                devise=proforma.devise,
-                statut="EMIS",
-            )
-
-        existing_facture = Facture.objects.filter(proforma=proforma).first()
-        if existing_facture is None:
-            fac_numero = f"FAC-{suffixe}"
-            if Facture.objects.filter(numero=fac_numero).exists():
-                fac_numero = f"FAC-{Facture.objects.count() + 1:05d}"
-            date_emission = timezone.now().date()
-            Facture.objects.create(
-                numero=fac_numero,
-                client=proforma.client,
-                proforma=proforma,
-                bon_commande=bon_commande,
-                montant_ht=proforma.montant_ht,
-                montant_ttc=proforma.montant_ttc,
-                devise=proforma.devise,
-                statut="EN_ATTENTE",
-                date_emission=date_emission,
-                date_echeance=date_emission + timedelta(days=30),
-                visible_client=True,
-            )
-
+        _accepter_proforma(proforma)
         serializer = self.get_serializer(proforma)
         return Response(serializer.data)
 
@@ -731,20 +949,11 @@ class BonCommandeViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        bon_commande.signature_client_image = signature
-        bon_commande.date_signature_client = timezone.now().date()
-        bon_commande.statut = "SIGNE_CLIENT"
-        bon_commande.save(update_fields=[
-            "signature_client_image", "date_signature_client", "statut",
-        ])
-
-        # Le bon de commande signe ("lu et approuve" / "bon pour accord")
-        # vaut validation du devis par le client : le service reception peut
-        # des lors receptionner les echantillons annonces, sans attendre le
+        # Le bon de commande signe ("lu et approuve" / "bon pour accord") vaut
+        # validation du devis par le client : le service reception peut des
+        # lors receptionner les echantillons annonces, sans attendre le
         # paiement de la facture (cf. qualite.EchantillonViewSet.perform_create).
-        facture = Facture.objects.filter(bon_commande=bon_commande).first()
-        if facture is not None:
-            _creer_demande_analyse_si_absente(facture)
+        _signer_bon_commande(bon_commande, signature)
 
         serializer = self.get_serializer(bon_commande, context={"request": request})
         return Response(serializer.data)
@@ -1313,6 +1522,34 @@ class DemandeAnalyseViewSet(viewsets.ModelViewSet):
         analyse = self.get_object()
         demande = analyse.demande_devis
 
+        # Rapport d'essai officiel (EN 001-PG019) remis par le service reception :
+        # il remplace le rapport generique des que tous ses exemplaires sont signes.
+        from qualite.models import RapportEssaiLabo
+        from qualite.pdf_circuit import rapport_pdf
+
+        officiels = list(
+            RapportEssaiLabo.objects.filter(fiche__demande=analyse, statut__in=["SIGNE", "REMIS"]).order_by("numero_ordre")
+        )
+        if officiels:
+            pdfs = [rapport_pdf(r) for r in officiels]
+            if len(pdfs) > 1:
+                try:
+                    from pypdf import PdfReader, PdfWriter
+
+                    writer = PdfWriter()
+                    for contenu in pdfs:
+                        for page in PdfReader(BytesIO(contenu)).pages:
+                            writer.add_page(page)
+                    sortie = BytesIO()
+                    writer.write(sortie)
+                    pdfs = [sortie.getvalue()]
+                except Exception:
+                    pass
+            return Response({
+                "filename": f"RapportEssai_{analyse.numero}.pdf",
+                "content": base64.b64encode(pdfs[0]).decode("ascii"),
+            })
+
         # Les echantillons sont desormais lies a la DemandeAnalyse (reception
         # apres paiement), et non plus a la DemandeDevis.
         echantillon = analyse.echantillons.order_by("-created_at").first()
@@ -1608,3 +1845,42 @@ class FinanciersKPIView(APIView):
         return Response(compute_financiers_kpis(
             request.query_params.get("date_debut"), request.query_params.get("date_fin")
         ))
+
+
+class CompteEmailLaboViewSet(viewsets.ModelViewSet):
+    """Comptes d'envoi (SMTP) du service reception — propres a chaque utilisateur."""
+
+    serializer_class = CompteEmailLaboSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return CompteEmailLabo.objects.filter(utilisateur=self.request.user)
+
+    def _controle(self):
+        if not user_has_permission(self.request.user, "echantillons.manage"):
+            raise PermissionDenied("Non autorisé")
+
+    def _unique_principal(self, compte):
+        if compte.est_principal:
+            CompteEmailLabo.objects.filter(utilisateur=self.request.user).exclude(pk=compte.pk).update(est_principal=False)
+
+    def perform_create(self, serializer):
+        self._controle()
+        premier = not CompteEmailLabo.objects.filter(utilisateur=self.request.user).exists()
+        compte = serializer.save(utilisateur=self.request.user, est_principal=serializer.validated_data.get("est_principal", premier) or premier)
+        self._unique_principal(compte)
+
+    def perform_update(self, serializer):
+        self._controle()
+        compte = serializer.save()
+        self._unique_principal(compte)
+
+    def perform_destroy(self, instance):
+        self._controle()
+        super().perform_destroy(instance)
+
+    @action(detail=True, methods=["post"], url_path="tester")
+    def tester(self, request, pk=None):
+        self._controle()
+        resultat = email_service.tester_connexion(self.get_object())
+        return Response(resultat, status=status.HTTP_200_OK if resultat["success"] else status.HTTP_400_BAD_REQUEST)
